@@ -1,4 +1,4 @@
-/* Pagewright — shared helpers */
+/* Edivora — shared helpers */
 'use strict';
 const PE = (window.PE = window.PE || {});
 

@@ -1,4 +1,4 @@
-/* Pagewright — bundled fonts: same bytes are used for on-screen display and for the exported PDF */
+/* Edivora — bundled fonts: same bytes are used for on-screen display and for the exported PDF */
 'use strict';
 (function () {
   const FAMILIES = [

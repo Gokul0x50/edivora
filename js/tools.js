@@ -1,4 +1,4 @@
-/* Pagewright — tools, selection, move/resize/rotate, text editing */
+/* Edivora — tools, selection, move/resize/rotate, text editing */
 'use strict';
 (function () {
   const V = PE.view;
@@ -130,6 +130,7 @@
         for (const k of hs) box.appendChild(PE.h('div', { class: 'hd hd-' + k, 'data-h': k }));
         if (!(o && o.type === 'table')) box.appendChild(PE.h('div', { class: 'hd hd-rot', 'data-h': 'rot', title: 'Rotate' }));
       }
+      if (o && !(T.editing && T.editing.kind === 'cell')) box.appendChild(PE.h('div', { class: 'sb-dup', 'data-h': 'dup', title: 'Duplicate (Ctrl+D)', html: PE.icon('copy') }));
       pv.ui.appendChild(box);
     } else {
       let x0 = Infinity,
@@ -171,6 +172,7 @@
     box.appendChild(
       PE.h('div', { class: 'grip', 'data-h': 'move', title: 'Drag to move this text', html: PE.icon('move') })
     );
+    box.appendChild(PE.h('div', { class: 'sb-dup', 'data-h': 'dup', title: 'Duplicate (Ctrl+D)', html: PE.icon('copy') }));
     pv.ui.appendChild(box);
   }
 
@@ -253,6 +255,10 @@
     const hd = e.target.closest('[data-h]');
     if (hd && !e.target.closest('.l-objs')) {
       e.preventDefault();
+      if (hd.getAttribute('data-h') === 'dup') {
+        e.stopPropagation();
+        return T.editing ? T.duplicateText() : T.duplicate();
+      }
       return startHandle(e, pg, hd.getAttribute('data-h'), p);
     }
     const tool = T.tool;
@@ -786,6 +792,9 @@
       const k = e.key.toLowerCase();
       const cur = T.currentTextStyle();
       T.applyTextStyle({ [k]: !(cur && cur[k]) });
+    } else if (PE.mod(e) && e.key.toLowerCase() === 'd' && T.editing && T.editing.kind !== 'cell') {
+      e.preventDefault();
+      T.duplicateText();
     } else if (PE.mod(e) && (e.key.toLowerCase() === 'z' || e.key.toLowerCase() === 'y')) {
       e.preventDefault();
       T.stopEditing();
@@ -820,9 +829,50 @@
     edInput();
   }
 
+  /** phones: keep the line being typed above the keyboard and the formatting bar */
+  T.keepCaretVisible = PE.debounce(function () {
+    if (!T.editing || !matchMedia('(max-width: 860px)').matches) return;
+    const s = window.getSelection();
+    if (!s.rangeCount) return;
+    let r = s.getRangeAt(0).getClientRects()[0];
+    if (!r) r = T.editing.el.getBoundingClientRect();
+    const sr = V.scroller.getBoundingClientRect();
+    const bottom = sr.bottom - 12;
+    if (r.bottom > bottom) V.scroller.scrollTop += r.bottom - bottom + 24;
+    else if (r.top < sr.top + 8) V.scroller.scrollTop -= sr.top + 8 - r.top + 24;
+  }, 60);
+  /** phones: bring the paragraph being edited near the top so it isn't hidden by the keyboard */
+  function revealForEditing(el) {
+    if (!matchMedia('(max-width: 860px)').matches) return;
+    // small text: zoom in so it's comfortable to read and type (zoom goes back when editing ends)
+    const ed = T.editing;
+    const st = ed && T.currentTextStyle();
+    const size = (st && st.s) || 12;
+    const sw = V.scroller.clientWidth - 24;
+    const bw = el.getBoundingClientRect().width / V.zoom;
+    const want = Math.min(15 / size, sw / Math.max(40, bw), 3);
+    if (want > V.zoom * 1.08) {
+      if (T._zoomBack == null) T._zoomBack = V.zoom;
+      const r = el.getBoundingClientRect();
+      const sr = V.scroller.getBoundingClientRect();
+      V.setZoom(want, { x: r.left - sr.left + 4, y: r.top - sr.top + 4 });
+      requestAnimationFrame(() => {
+        const r2 = el.getBoundingClientRect();
+        V.scroller.scrollLeft += r2.left - sr.left - 12;
+      });
+    }
+    setTimeout(() => {
+      const sr = V.scroller.getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      if (r.top < sr.top + 8 || r.top > sr.top + sr.height * 0.35) V.scroller.scrollTo({ top: V.scroller.scrollTop + r.top - sr.top - sr.height * 0.1, behavior: 'smooth' });
+    }, 120);
+    setTimeout(() => T.keepCaretVisible(), 450);
+  }
+
   function edInput() {
     const ed = T.editing;
     if (!ed) return;
+    T.keepCaretVisible();
     const pg = PE.findPage(ed.pg);
     if (!pg) return;
     // normalise structure the browser may have added (divs, font tags)
@@ -843,6 +893,7 @@
     } else if (ed.kind === 'cell') {
       const o = PE.findObj(pg, ed.id);
       o.rows[ed.r][ed.c].t = runs.map((r) => r.t).join('');
+      if (o.src) V.layoutBase(pg); // a table from the PDF pushes the content below it
     }
     T.redrawSelection();
     PE.commitSoon();
@@ -861,6 +912,7 @@
     placeCaret(t, pt);
     T.select([{ pg: pg.id, id: o.id }]);
     if (isNew) T.editing.isNew = true;
+    revealForEditing(t);
   };
 
   T.startEditBase = async function (pg, b, pt) {
@@ -886,6 +938,7 @@
     placeCaret(el, pt);
     T.redrawSelection();
     PE.ui.refreshProps();
+    revealForEditing(el);
   };
 
   function startEditCell(pg, o, el, pt) {
@@ -1024,10 +1077,19 @@
       }
       const o = PE.findObj(pg, ed.id);
       if (o) o.rows[ed.r][ed.c].t = V.readRuns(ed.el, ed.styleFallback).map((r) => r.t).join('');
+      if (o && o.src) V.layoutBase(pg);
     }
     PE.commit();
     if (!keepSelection) {
       if (ed.kind === 'base') T.sel = [];
+    }
+    // phones: back to the zoom from before editing
+    if (T._zoomBack != null && !keepSelection) {
+      const z = T._zoomBack;
+      T._zoomBack = null;
+      setTimeout(() => {
+        if (!T.editing) V.setZoom(z);
+      }, 60);
     }
     T.redrawSelection();
     PE.ui.refreshProps();
@@ -1318,6 +1380,49 @@
     PE.commit();
     T.select(ids.map((id) => ({ pg: pg.id, id })));
   };
+  /** Duplicate the text being edited: a text box, or a paragraph of the PDF (the copy becomes a movable text box). */
+  T.duplicateText = function () {
+    const ed = T.editing;
+    if (!ed || ed.kind === 'cell') return T.duplicate();
+    const pg = PE.findPage(ed.pg);
+    if (ed.kind === 'obj') {
+      T.stopEditing();
+      if (!PE.findObj(pg, ed.id)) return;
+      T.select([{ pg: pg.id, id: ed.id }]);
+      return T.duplicate();
+    }
+    // PDF text block
+    const pv = V.els.get(pg.id);
+    const el = pv && pv.baseEls[ed.id];
+    const ex = PE.ex[PE.pageKey(pg)];
+    const b = ex && ex.blocks.find((x) => x.id === ed.id);
+    if (!el || !b) return;
+    const runs = V.readRuns(el, ed.styleFallback);
+    const info = V.blockInfo(pg, ex, b);
+    const box = { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight };
+    T.stopEditing();
+    if (!runs.map((r) => r.t).join('').trim()) return;
+    const { H } = PE.baseSize(pg);
+    const gap = 14;
+    const o = {
+      id: PE.uid('o'),
+      type: 'text',
+      x: box.x + gap,
+      y: Math.min(box.y + gap, H - box.h - 4),
+      w: Math.ceil(box.w + 2),
+      h: box.h,
+      rot: 0,
+      runs: PE.clone(runs),
+      align: info.align || 'left',
+      lh: info.lh || 1.2,
+    };
+    pg.objs.push(o);
+    V.renderOverlay(pg);
+    PE.commit();
+    T.setTool('edit');
+    T.select([{ pg: pg.id, id: o.id }]);
+    PE.toast('Text duplicated. Drag the copy to where you want it.', 'ok');
+  };
   T.copy = function () {
     const items = T.selObjs().filter((it) => !it.base);
     if (items.length) T.clipboard = items.map((it) => PE.clone(it.o));
@@ -1459,9 +1564,17 @@
       c = ed.c;
     const cols = o.rows[0].length;
     const blankRow = () => Array.from({ length: cols }, () => ({ t: '' }));
-    if (op === 'rowAbove') o.rows.splice(r, 0, blankRow());
-    else if (op === 'rowBelow') o.rows.splice(r + 1, 0, blankRow());
-    else if (op === 'rowDel' && o.rows.length > 1) o.rows.splice(r, 1);
+    const rhOf = (k) => (o.rh ? o.rh[PE.clamp(k, 0, o.rh.length - 1)] : 0);
+    if (op === 'rowAbove') {
+      o.rows.splice(r, 0, blankRow());
+      if (o.rh) o.rh.splice(r, 0, rhOf(r));
+    } else if (op === 'rowBelow') {
+      o.rows.splice(r + 1, 0, blankRow());
+      if (o.rh) o.rh.splice(r + 1, 0, rhOf(r));
+    } else if (op === 'rowDel' && o.rows.length > 1) {
+      o.rows.splice(r, 1);
+      if (o.rh) o.rh.splice(r, 1);
+    }
     else if (op === 'colLeft' || op === 'colRight') {
       const at2 = op === 'colLeft' ? c : c + 1;
       const share = o.w / (cols + 1);
@@ -1481,11 +1594,161 @@
     T.editCell(pg, o, nr, nc);
   };
 
+  /** Turn a table found in the PDF (its ruling lines give the exact rows and columns) into an editable table. */
+  T.convertDetected = function (pg, tid) {
+    const ex = PE.ex[PE.pageKey(pg)];
+    const D = ex && (ex.tables || []).find((t) => t.id === tid);
+    if (!D) return false;
+    const pv = V.els.get(pg.id);
+    const shift = (pv && pv.shift) || {};
+    const ys = (pv && pv.tys && pv.tys[tid]) || D.ys;
+    let xs = D.xs.slice();
+    const mem = new Set(D.mem.map((m) => m.id));
+    const blocks = ex.blocks.filter((b) => mem.has(b.id) && !(pg.ov[b.id] && pg.ov[b.id].del));
+    if (xs.length < 2) {
+      // no vertical rules: columns from where the text starts
+      const lefts = blocks.map((b) => b.x).sort((a, b) => a - b);
+      xs = [D.x];
+      for (const x of lefts) if (x - xs[xs.length - 1] > 12 && xs.length > 0 && x > D.x + 12) xs.push(x - 5);
+      xs.push(D.x + D.w);
+    }
+    // rows (thin slivers between double rules are not rows)
+    const rowB = [ys[0]],
+      rowO = [D.ys[0]]; // same boundaries in the PDF's own coordinates
+    for (let k = 1; k < ys.length; k++)
+      if (ys[k] - rowB[rowB.length - 1] > 5 || k === ys.length - 1) {
+        rowB.push(ys[k]);
+        rowO.push(D.ys[k]);
+      }
+    if (rowB.length > 2 && rowB[rowB.length - 1] - rowB[rowB.length - 2] <= 5) {
+      rowB.splice(rowB.length - 2, 1);
+      rowO.splice(rowO.length - 2, 1);
+    }
+    const nr = rowB.length - 1,
+      nc = xs.length - 1;
+    if (nr < 1 || nc < 1) return false;
+    const grid = Array.from({ length: nr }, () => Array.from({ length: nc }, () => ({ t: '' })));
+    const find = (arr, v) => {
+      let k = 0;
+      while (k < arr.length - 2 && v > arr[k + 1]) k++;
+      return k;
+    };
+    const pads = [],
+      padsY = [];
+    const runs = [];
+    const placed = blocks
+      .map((b) => {
+        const ov = pg.ov[b.id] || {};
+        const info = V.blockInfo(pg, ex, b);
+        const x = b.x + (ov.dx || 0),
+          y = b.top + (shift[b.id] || 0) + (ov.dy || 0);
+        return { b, info, x, y, cx: x + b.w / 2, cy: y + b.h / 2 };
+      })
+      .sort((a, b) => a.y - b.y || a.x - b.x);
+    for (const p of placed) {
+      const ri = find(rowB, p.cy),
+        ci = find(xs, p.cx);
+      const cell = grid[ri][ci];
+      const t = p.info.runs.map((x) => x.t).join('');
+      cell.t = cell.t ? cell.t + '\n' + t : t;
+      const r0 = p.info.runs[0];
+      if (r0 && p.info.runs.every((x) => x.b)) cell.b = true;
+      if (p.info.align === 'center' || p.info.align === 'right') cell.align = p.info.align;
+      pads.push(p.x - xs[ci]);
+      if (!cell.t.includes('\n') && r0) {
+        // padding that puts the baseline where it was: line top + half leading + ascent
+        const m = PE.fonts.metrics(r0.f, r0.b, r0.i);
+        const baseline = p.b.y0 + (p.y - p.b.top);
+        padsY.push(baseline - rowB[ri] - ((1.2 - m.asc - m.desc) * r0.s) / 2 - m.asc * r0.s);
+      }
+      runs.push(...p.info.runs);
+      pg.ov[p.b.id] = { del: true };
+    }
+    // cell shading from filled boxes of the table
+    const gById = {};
+    for (const g of ex.graphics || []) gById[g.id] = g;
+    let border = '#000000',
+      bw = 0.75;
+    const lw = [];
+    for (const id of D.gids) {
+      const g = gById[id];
+      if (!g) continue;
+      if (g.k === 'rect' && g.w > 3 && g.h > 3)
+        grid.forEach((row, ri) =>
+          row.forEach((cell, ci) => {
+            const cx = (xs[ci] + xs[ci + 1]) / 2,
+              cy = (rowO[ri] + rowO[ri + 1]) / 2;
+            if (cx > g.x && cx < g.x + g.w && cy > g.y && cy < g.y + g.h) cell.bg = g.c;
+          })
+        );
+      else {
+        border = g.c;
+        lw.push(g.k === 'line' ? g.lw : Math.min(g.w, g.h));
+      }
+      pg.ov[id] = { del: true };
+    }
+    for (const m of D.mem) if (m.g) pg.ov[m.id] = { del: true };
+    if (lw.length) bw = PE.clamp(lw.sort((a, b) => a - b)[Math.floor(lw.length / 2)], 0.25, 3);
+    const main = runs.slice().sort((a, b) => b.t.length - a.t.length)[0] || T.defaults.text;
+    const sizes = runs.map((x) => x.s).sort((a, b) => a - b);
+    const size = sizes[Math.floor(sizes.length / 2)] || 10;
+    const med = (a, d) => (a.length ? a.sort((x, y) => x - y)[Math.floor(a.length / 2)] : d);
+    const pad = PE.clamp(med(pads, 4), 1.5, 10);
+    const padY = PE.clamp(med(padsY, 2), 0, 10);
+    // keep one-line rows as tall as they were
+    const oneLine = grid.map((row, ri) => (row.every((c) => !c.t.includes('\n')) ? rowB[ri + 1] - rowB[ri] : Infinity));
+    const minRow = Math.min(...oneLine);
+    let padYfit = padY;
+    if (isFinite(minRow)) padYfit = PE.clamp(Math.min(padY, (minRow - 1.2 * size - bw) / 2), 0, 10);
+    const top = rowB[0],
+      bottom = rowB[rowB.length - 1];
+    const o = {
+      id: PE.uid('o'),
+      type: 'table',
+      x: xs[0],
+      y: top,
+      w: xs[xs.length - 1] - xs[0],
+      h: bottom - top,
+      rot: 0,
+      rows: grid,
+      cw: xs.slice(1).map((x, k) => x - xs[k]),
+      rh: rowB.slice(1).map((y, k) => y - rowB[k]),
+      f: main.f || 'arimo',
+      size,
+      color: main.c || '#000000',
+      border,
+      bw,
+      pad,
+      padY: padYfit,
+      src: tid,
+      h0: bottom - top,
+      head: false,
+      headBg: null,
+      lh: 1.2,
+      cover: { x: D.x - 1, y: top - 1, w: D.w + 2, h: bottom - top + 2, c: D.bg || '#ffffff' },
+    };
+    pg.objs.push(o);
+    V.renderOverlay(pg);
+    PE.commit();
+    T.setTool('edit');
+    T.select([{ pg: pg.id, id: o.id }]);
+    PE.toast(`Table with ${nr} rows and ${nc} columns is ready to edit. Use the panel to add or remove rows and columns.`, 'ok');
+    return true;
+  };
+
   /** Turn the PDF text inside a rectangle into an editable table object. */
   T.convertTable = async function (pg, r) {
     const ex = PE.ex[PE.pageKey(pg)];
     if (!ex) return PE.toast('This page has no PDF text to convert.', 'warn');
     const pv = V.els.get(pg.id);
+    // a table found in the PDF under the dragged area: use its exact grid
+    const area = (a) => Math.max(0, a.w) * Math.max(0, a.h);
+    const hit = (ex.tables || []).find((D) => {
+      const ix = Math.min(D.x + D.w, r.x + r.w) - Math.max(D.x, r.x),
+        iy = Math.min(D.y + D.h, r.y + r.h) - Math.max(D.y, r.y);
+      return ix > 0 && iy > 0 && (ix * iy) / area(D) > 0.4 && D.mem.some((m) => !m.g && !(pg.ov[m.id] && pg.ov[m.id].del));
+    });
+    if (hit && T.convertDetected(pg, hit.id)) return;
     const shift = (pv && pv.shift) || {};
     // positions as shown (after any push from edited text above)
     const shown = (b) => {
@@ -1507,9 +1770,10 @@
       return { b, t: info.runs.map((x) => x.t).join(''), x: s.x, r: s.x + b.w, y: s.top, bt: s.top + b.h, run: info.runs[0] };
     });
     // the table's own lines and shading go too, so they can't show through later
+    const gpos = (pv && pv.gpos) || {};
     for (const g of ex.graphics || []) {
-      const gy = g.y + (shift[g.id] || 0);
-      if (g.x >= r.x - 2 && g.x + g.w <= r.x + r.w + 2 && gy >= r.y - 2 && gy + g.h <= r.y + r.h + 2) pg.ov[g.id] = { del: true };
+      const gr = gpos[g.id] || g;
+      if (gr.x >= r.x - 2 && gr.x + gr.w <= r.x + r.w + 2 && gr.y >= r.y - 2 && gr.y + gr.h <= r.y + r.h + 2) pg.ov[g.id] = { del: true };
     }
     // rows: cluster by vertical overlap
     cells.sort((a, b) => a.y - b.y);

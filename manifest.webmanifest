@@ -1,0 +1,16 @@
+{
+  "name": "Edivora – PDF, Word, Image, Audio & Video Editor",
+  "short_name": "Edivora",
+  "description": "Free online editor for PDF, Word, photos, audio and video that runs in your browser.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f5f8",
+  "theme_color": "#1f3fcf",
+  "icons": [
+    { "src": "assets/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "assets/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "assets/favicon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ],
+  "categories": ["productivity", "photo", "music", "utilities"]
+}

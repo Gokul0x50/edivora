@@ -1,4 +1,4 @@
-/* Pagewright — start-up, opening files, keyboard, drag & drop, saving */
+/* Edivora — start-up, opening files, keyboard, drag & drop, saving */
 'use strict';
 (function () {
   const V = PE.view,
@@ -7,16 +7,83 @@
   const A = PE.app;
   const $ = PE.$;
 
+  const isDocx = (f) => /\.docx$/i.test(f.name) || f.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  const isPdf = (f) => /pdf$/i.test(f.type) || /\.pdf$/i.test(f.name);
+  const ACCEPT = 'application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*,audio/*,video/*,.mkv,.mov,.m4a,.flac,.opus';
+  const ACCEPTS = {
+    pdf: 'application/pdf,.pdf,image/*',
+    docx: '.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    image: 'image/*',
+    audio: 'audio/*,.m4a,.flac,.opus,.ogg,.wav,.mp3,video/*',
+    video: 'video/*,.mkv,.mov,audio/*,image/*',
+  };
+  const mm = () => PE.mm && PE.mm.cur;
+  const HOME_TITLE = document.title;
+  A.mode = () => (mm() ? mm().name : PE.doc && PE.doc.active ? 'doc' : 'pdf');
+  A.hasWork = () => !!(mm() || PE.S.pages.length || (PE.doc && PE.doc.active));
   A.setFileName = function (n) {
-    n = (n || '').trim() || 'document.pdf';
-    if (!/\.pdf$/i.test(n)) n += '.pdf';
+    const m = mm();
+    const ext = m ? m.ext : A.mode() === 'doc' ? '.docx' : '.pdf';
+    n = (n || '').trim() || (m ? 'Untitled' : 'document') + ext;
+    n = n.replace(/\.[a-z0-9]{2,4}$/i, '') + ext;
     A.fileName = n;
     $('#file-name').value = n;
     $('#file-name').style.width = Math.min(46, n.length + 3) + 'ch';
-    document.title = n.replace(/\.pdf$/i, '') + ' · Pagewright';
+    // the start page keeps its descriptive title (search engines read it)
+    document.title = A.hasWork() ? n.replace(/\.[a-z0-9]{2,4}$/i, '') + ' · Edivora' : HOME_TITLE;
+  };
+
+  /** start one of the media editors (image / audio / video) */
+  A.openMedia = async function (name, files, opts = {}) {
+    if (!opts.force && !(await confirmDiscard())) return;
+    const m = PE.mm.list[name];
+    U.busy(true, files && files.length ? 'Opening ' + files[0].name : 'Starting the ' + m.label.toLowerCase() + ' editor', 0.2);
+    try {
+      resetAll();
+      await PE.clearSession();
+      PE.mm.cur = m;
+      document.body.classList.add('mode-media');
+      $('#app').classList.remove('no-doc');
+      A.setFileName(files && files.length ? files[0].name : 'Untitled');
+      await m.open(files || [], opts);
+      A.setFileName(A.fileName);
+      A.dirty = !!opts.dirty;
+      U.updateHistoryButtons();
+    } catch (e) {
+      console.error(e);
+      resetAll();
+      $('#app').classList.add('no-doc');
+      PE.toast((e && e.message) || 'This file could not be opened.', 'error', 7000);
+    } finally {
+      U.busy(false);
+    }
+  };
+  A.newImage = async function () {
+    if (!(await confirmDiscard())) return;
+    const size = await PE.img.newDialog();
+    if (size) A.openMedia('image', [], { size, force: true });
+  };
+  A.newAudio = (o = {}) => A.openMedia('audio', [], o);
+  A.newVideo = () => A.openMedia('video', []);
+  A.openKind = async function (kind) {
+    const files = await PE.pickFiles(ACCEPTS[kind] || ACCEPT, kind !== 'docx');
+    if (!files.length) return;
+    if (kind === 'pdf') return A.openFiles(files, { asPdf: true });
+    if (kind === 'docx') return A.openDocx(files[0]);
+    return A.openMedia(kind, files);
   };
 
   function resetAll() {
+    if (mm()) {
+      try {
+        mm().close();
+      } catch (e) {
+        console.error(e);
+      }
+      PE.mm.cur = null;
+      document.body.classList.remove('mode-media', 'mpanel-min');
+    }
+    if (PE.doc && PE.doc.active) PE.doc.close();
     if (T.editing) T.stopEditing();
     T.sel = [];
     for (const id in PE.docs) {
@@ -58,7 +125,22 @@
     return { id: PE.uid('p'), src: { t: 'img', a: id, w, h: hgt }, rot: 0, objs: [], ov: {} };
   }
 
+  /** the document as it was opened, for “Original” view and “Revert to original” */
+  function rememberOriginal() {
+    const S = PE.clone(PE.S);
+    for (const p of S.pages) {
+      p.objs = [];
+      p.ov = {};
+    }
+    S.hf = PE.defaultHF();
+    S.wm = PE.defaultWM();
+    S.form = {};
+    S.ocr = {};
+    A.origState = JSON.stringify(S);
+  }
   async function startDoc(fresh) {
+    if (fresh) rememberOriginal();
+    A.showOriginal(false);
     $('#app').classList.remove('no-doc');
     document.body.classList.remove('pages-open');
     V.sync();
@@ -73,10 +155,20 @@
   }
 
   /** Open files as a new document (first PDF/image starts it, the rest are appended). */
-  A.openFiles = async function (files) {
-    files = files.filter((f) => /pdf$/i.test(f.type) || /\.pdf$/i.test(f.name) || /^image\//.test(f.type));
-    if (!files.length) return PE.toast('Choose a PDF or an image file.', 'warn');
-    if (PE.S.pages.length && A.dirty) {
+  A.openFiles = async function (files, opts = {}) {
+    if (files.some((f) => /\.doc$/i.test(f.name)) && !files.some((f) => isPdf(f) || isDocx(f)))
+      return PE.toast('Old .doc files can\'t be opened. Save it as .docx in Word (File → Save As) and open that.', 'warn', 7000);
+    const docx = files.find(isDocx);
+    if (docx) return A.openDocx(docx);
+    // pictures, sound and video open in their own editors (pictures go into a PDF only when asked)
+    if (!opts.asPdf && !files.some(isPdf)) {
+      const kinds = files.map(PE.kindOf);
+      const k = kinds.find((x) => x === 'video') || kinds.find((x) => x === 'audio') || kinds.find((x) => x === 'image');
+      if (k) return A.openMedia(k, files.filter((f) => PE.kindOf(f) !== 'other'), opts);
+    }
+    files = files.filter((f) => isPdf(f) || /^image\//.test(f.type));
+    if (!files.length) return PE.toast('Choose a PDF, Word, image, audio or video file.', 'warn');
+    if (A.hasWork() && A.dirty && !opts.force) {
       const ok = await U.confirm('Open another file?', `Your changes to ${A.fileName} will be lost unless you download it first.`, 'Open file', true);
       if (!ok) return;
     }
@@ -141,11 +233,142 @@
   };
 
   A.openPicker = async function () {
-    const files = await PE.pickFiles('application/pdf,.pdf,image/*', true);
+    const files = await PE.pickFiles(ACCEPT, true);
     if (files.length) A.openFiles(files);
   };
 
+  /* ---------- Word documents ---------- */
+  async function confirmDiscard() {
+    if (A.hasWork() && A.dirty)
+      return U.confirm('Open another file?', `Your changes to ${A.fileName} will be lost unless you download it first.`, 'Open file', true);
+    return true;
+  }
+  A.openDocx = async function (file) {
+    if (!(await confirmDiscard())) return;
+    U.busy(true, 'Opening ' + file.name, 0.2);
+    try {
+      const D = await PE.docx.read(await PE.readFile(file), file.name);
+      resetAll();
+      await PE.clearSession();
+      await PE.doc.clearSession();
+      await PE.doc.open(D);
+      A.setFileName(file.name);
+    } catch (e) {
+      console.error(e);
+      PE.toast('This Word file could not be opened. ' + (e.message || ''), 'error', 7000);
+      if (A.mode() !== 'doc' && !PE.S.pages.length) $('#app').classList.add('no-doc');
+    } finally {
+      U.busy(false);
+    }
+  };
+  A.newDoc = async function () {
+    if (!(await confirmDiscard())) return;
+    const letter = /^en-(US|CA)|^es-(MX|US)/.test(navigator.language || '');
+    const D = await PE.docx.read(await PE.docx.blank({ letter }), 'Untitled.docx');
+    resetAll();
+    await PE.clearSession();
+    await PE.doc.clearSession();
+    await PE.doc.open(D);
+    A.setFileName('Untitled.docx');
+  };
+  /** PDF -> editable Word document (in the Word editor) */
+  A.pdfToWord = async function () {
+    if (!PE.S.pages.length) return;
+    A.showOriginal(false);
+    if (T.editing) T.stopEditing();
+    U.busy(true, 'Converting to a Word document', 0.05);
+    try {
+      const D = await PE.pdfToDoc((f, t) => U.busy(true, t, f * 0.8));
+      const name = A.fileName.replace(/\.pdf$/i, '') + '.docx';
+      resetAll();
+      await PE.clearSession();
+      await PE.doc.open(D, { dirty: true });
+      A.setFileName(name);
+      PE.toast('Now editing as a Word document. Download as .docx or PDF from the Download button.', 'ok', 6000);
+    } catch (e) {
+      console.error(e);
+      PE.toast('Could not convert: ' + (e.message || e), 'error', 7000);
+    } finally {
+      U.busy(false);
+    }
+  };
+  /** Word document -> PDF editor (to sign, draw, fill forms, merge…) */
+  A.wordToPdfEditor = async function () {
+    if (A.mode() !== 'doc') return;
+    A.showOriginal(false);
+    U.busy(true, 'Making a PDF', 0.05);
+    try {
+      const { bytes } = await PE.doc.pdfBytes((f, t) => U.busy(true, t, f));
+      const name = A.fileName.replace(/\.docx$/i, '') + '.pdf';
+      await PE.doc.clearSession();
+      await A.openFiles([new File([bytes], name, { type: 'application/pdf' })], { force: true });
+      A.dirty = true;
+      U.updateHistoryButtons();
+    } catch (e) {
+      console.error(e);
+      PE.toast('Could not make the PDF: ' + (e.message || e), 'error', 7000);
+    } finally {
+      U.busy(false);
+    }
+  };
+  /** Download menu: the current format first, the other one second */
+  A.downloadMenu = function (anchor) {
+    if (mm()) return mm().downloadMenu(anchor);
+    const doc = A.mode() === 'doc';
+    const base = A.fileName.replace(/\.(pdf|docx)$/i, '');
+    const items = doc
+      ? [
+          { label: `Word document (${base}.docx)`, icon: 'word', kbd: PE.isMac ? '⌘S' : 'Ctrl+S', onClick: () => A.download({ format: 'docx' }) },
+          { label: 'PDF', icon: 'file', onClick: () => A.download({ format: 'pdf' }) },
+          '-',
+          { label: 'Open in the PDF editor', icon: 'convert', onClick: () => A.wordToPdfEditor() },
+        ]
+      : [
+          { label: `PDF (${base}.pdf)`, icon: 'file', kbd: PE.isMac ? '⌘S' : 'Ctrl+S', onClick: () => A.download({ format: 'pdf' }) },
+          { label: 'Word document (.docx)', icon: 'word', onClick: () => A.download({ format: 'docx' }) },
+          '-',
+          { label: 'Edit as a Word document', icon: 'convert', onClick: () => A.pdfToWord() },
+        ];
+    U.menu(anchor, items);
+  };
+
+  /* ---------- original / edited ---------- */
+  A.showOriginal = function (on) {
+    on = !!on;
+    if (on && mm()) return;
+    const was = document.body.classList.contains('show-original');
+    if (on === was) return;
+    if (on && T.editing) T.stopEditing();
+    if (A.mode() === 'doc') PE.doc.showOriginal(on);
+    else if (on) T.clearSelection && T.clearSelection();
+    document.body.classList.toggle('show-original', on);
+    $('#orig-banner').hidden = !on;
+    const b = $('#btn-compare');
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    b.classList.toggle('on', on);
+    b.querySelector('span').textContent = on ? 'Edited' : 'Original';
+    b.title = on ? 'Back to your edited version' : 'See the original file (your edits are kept)';
+  };
+  A.toggleOriginal = () => A.showOriginal(!document.body.classList.contains('show-original'));
+  A.revertToOriginal = async function () {
+    const ok = await U.confirm('Revert to the original?', 'All your changes are removed and the file goes back to how it was when you opened it. You can still use Undo to get them back.', 'Revert', true);
+    if (!ok) return;
+    A.showOriginal(false);
+    if (A.mode() === 'doc') return PE.doc.revert();
+    if (!A.origState) return;
+    if (T.editing) T.stopEditing();
+    PE.S = JSON.parse(A.origState);
+    for (const key in PE.ex) if (PE.ex[key] && PE.ocr) PE.ocr.mergeInto(key, PE.ex[key]);
+    T.clearSelection && T.clearSelection(true);
+    V.sync();
+    V.relayoutAll();
+    PE.commit();
+    U.refreshAll();
+    PE.toast('Back to the original file. Undo brings your changes back.', 'ok', 5000);
+  };
+
   A.newBlank = async function () {
+    if (!(await confirmDiscard())) return;
     resetAll();
     await PE.clearSession();
     PE.S.pages = [{ id: PE.uid('p'), src: { t: 'blank', w: 595.28, h: 841.89 }, rot: 0, objs: [], ov: {} }];
@@ -161,14 +384,61 @@
     }
     resetAll();
     await PE.clearSession();
+    await PE.doc.clearSession();
     $('#app').classList.add('no-doc');
+    document.title = HOME_TITLE;
     PE.hist.reset();
     U.refreshAll();
     checkRestore();
   };
 
   A.download = async function (opts = {}) {
+    if (mm()) return mm().download();
+    A.showOriginal(false);
+    const doc = A.mode() === 'doc';
+    const format = opts.format || (doc ? 'docx' : 'pdf');
+    const base = (opts.name || A.fileName).replace(/\.(pdf|docx)$/i, '');
+    if (doc) {
+      U.busy(true, format === 'docx' ? 'Saving the Word document' : 'Preparing your PDF', 0.05);
+      try {
+        if (format === 'docx') {
+          const bytes = await PE.doc.docxBytes();
+          PE.download(bytes, base + '.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+          A.dirty = false;
+          U.updateHistoryButtons();
+          PE.toast('Downloaded ' + base + '.docx', 'ok');
+        } else {
+          const { bytes, missing } = await PE.doc.pdfBytes((f, t) => U.busy(true, t, f));
+          PE.download(bytes, base + '.pdf');
+          if (missing) PE.toast(`Downloaded. ${missing} character(s) such as emoji are not in the bundled fonts and were left out.`, 'warn', 7000);
+          else PE.toast('Downloaded ' + base + '.pdf', 'ok');
+        }
+      } catch (e) {
+        console.error(e);
+        PE.toast('Could not save: ' + (e.message || e), 'error', 7000);
+      } finally {
+        U.busy(false);
+      }
+      return;
+    }
     if (!PE.S.pages.length) return;
+    if (format === 'docx') {
+      if (T.editing) T.stopEditing();
+      U.busy(true, 'Converting to Word', 0.05);
+      try {
+        const D = await PE.pdfToDoc((f, t) => U.busy(true, t, f * 0.8));
+        U.busy(true, 'Writing the Word file', 0.9);
+        const bytes = await PE.docx.fromHtml(D);
+        PE.download(bytes, base + '.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+        PE.toast('Downloaded ' + base + '.docx', 'ok');
+      } catch (e) {
+        console.error(e);
+        PE.toast('Could not create the Word file: ' + (e.message || e), 'error', 7000);
+      } finally {
+        U.busy(false);
+      }
+      return;
+    }
     U.busy(true, 'Preparing your PDF', 0.02);
     try {
       const { bytes, missing } = await PE.exportPdf({ pageIds: opts.pageIds, onProgress: (f, t) => U.busy(true, t, f) });
@@ -360,10 +630,19 @@
   };
 
   /* ---------- restore unsaved work ---------- */
+  let restoreKind = 'pdf';
   async function checkRestore() {
-    const s = await PE.idb.get('session');
+    let s = await PE.idb.get('session');
+    const ds = await PE.idb.get('docsession');
     const card = $('#restore-card');
-    if (!s || !s.keys || !s.keys.length) {
+    if (!s || !s.keys || !s.keys.length) s = null;
+    restoreKind = 'pdf';
+    if (ds && (!s || ds.time > s.time)) {
+      s = ds;
+      s.fileName = ds.name;
+      restoreKind = 'doc';
+    }
+    if (!s) {
       card.hidden = true;
       return;
     }
@@ -375,10 +654,27 @@
   }
   async function restore() {
     U.busy(true, 'Restoring your work', 0.3);
+    if (restoreKind === 'doc') {
+      try {
+        resetAll();
+        const ok = await PE.doc.loadSession();
+        if (!ok) throw new Error('Nothing to restore.');
+        A.setFileName(A.fileName);
+        PE.toast('Your unsaved work is back.', 'ok');
+      } catch (e) {
+        console.error(e);
+        $('#app').classList.add('no-doc');
+        PE.toast('Saved work could not be restored. ' + (e.message || ''), 'error');
+      } finally {
+        U.busy(false);
+      }
+      return;
+    }
     try {
       resetAll();
       const ok = await PE.loadSession();
       if (!ok || !PE.S.pages.length) throw new Error('Nothing to restore.');
+      rememberOriginal();
       A.setFileName(A.fileName);
       await startDoc(true);
       A.dirty = true;
@@ -397,6 +693,13 @@
   /* ---------- keyboard ---------- */
   function onKey(e) {
     if ($('#modal-root').children.length) return;
+    if (mm()) return onMediaKey(e);
+    // looking at the original: any editing key goes back to the edited version first
+    if (document.body.classList.contains('show-original')) {
+      if (e.key === 'Escape') return A.showOriginal(false);
+      if (PE.mod(e) && /^[zy]$/i.test(e.key)) A.showOriginal(false);
+    }
+    if (A.mode() === 'doc') return onDocKey(e);
     const t = e.target;
     const inField = t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable);
     const mod = PE.mod(e);
@@ -470,8 +773,55 @@
     if (k === 'i') return U.insertImage();
   }
 
+  function onMediaKey(e) {
+    const mod = PE.mod(e);
+    const k = e.key.toLowerCase();
+    if (e.type === 'keydown' && mod && k === 's') {
+      e.preventDefault();
+      return mm().download();
+    }
+    if (e.type === 'keydown' && mod && k === 'o') {
+      e.preventDefault();
+      return A.openPicker();
+    }
+    mm().onKey && mm().onKey(e);
+  }
+
+  function onDocKey(e) {
+    const mod = PE.mod(e);
+    const k = e.key.toLowerCase();
+    if (mod && k === 's') {
+      e.preventDefault();
+      return A.download();
+    }
+    if (mod && k === 'o') {
+      e.preventDefault();
+      return A.openPicker();
+    }
+    const inBody = e.target && e.target.closest && e.target.closest('.dm-body');
+    const inField = e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+    if (!inBody && !inField && mod && (k === 'z' || k === 'y')) {
+      e.preventDefault();
+      return k === 'y' || e.shiftKey ? PE.doc.redo() : PE.doc.undo();
+    }
+    if (mod && (k === '=' || k === '+')) {
+      e.preventDefault();
+      return PE.doc.setZoom(PE.doc.zoom * 1.15);
+    }
+    if (mod && k === '-') {
+      e.preventDefault();
+      return PE.doc.setZoom(PE.doc.zoom / 1.15);
+    }
+    if (mod && k === '0') {
+      e.preventDefault();
+      return PE.doc.fitWidth();
+    }
+  }
+
   /* ---------- paste & drop ---------- */
   async function onPaste(e) {
+    if (mm()) return mm().onPaste && mm().onPaste(e);
+    if (A.mode() === 'doc') return;
     const t = e.target;
     if (t && (/^(INPUT|TEXTAREA)$/.test(t.tagName) || t.isContentEditable)) return;
     if (!PE.S.pages.length || $('#modal-root').children.length) return;
@@ -511,7 +861,9 @@
       e.preventDefault();
       depth++;
       veil.hidden = false;
-      veil.querySelector('p').textContent = PE.S.pages.length ? 'Drop PDFs to add pages, or an image to place it' : 'Drop to open';
+      veil.querySelector('p').textContent = mm()
+        ? mm().dropText || 'Drop to add'
+        : A.mode() === 'doc' ? 'Drop a PDF or Word file to open it' : PE.S.pages.length ? 'Drop PDFs to add pages, or an image to place it' : 'Drop to open';
     });
     window.addEventListener('dragover', (e) => {
       if (hasFiles(e)) e.preventDefault();
@@ -526,7 +878,16 @@
       depth = 0;
       veil.hidden = true;
       const files = Array.from(e.dataTransfer.files);
-      if (!PE.S.pages.length) return A.openFiles(files);
+      if (mm()) {
+        const kinds = files.map(PE.kindOf);
+        if (mm().accepts && kinds.every((k) => mm().accepts.includes(k))) return mm().addFiles(files, e);
+        return A.openFiles(files);
+      }
+      if (A.mode() === 'doc') {
+        if (files.some((f) => isPdf(f) || isDocx(f))) return A.openFiles(files);
+        return; // pictures dropped on the document are handled by the editor
+      }
+      if (!PE.S.pages.length || files.some(isDocx) || files.some((f) => /^(audio|video)$/.test(PE.kindOf(f)))) return A.openFiles(files);
       const pdfs = files.filter((f) => /pdf$/i.test(f.type) || /\.pdf$/i.test(f.name));
       const imgs = files.filter((f) => /^image\//.test(f.type));
       if (pdfs.length) {
@@ -562,7 +923,8 @@
     A.setFileName('document.pdf');
     $('#file-name').addEventListener('change', (e) => {
       A.setFileName(e.target.value);
-      PE.markDirty();
+      if (mm()) A.dirty = true;
+      else PE.markDirty();
     });
     $('#file-name').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') e.target.blur();
@@ -580,13 +942,22 @@
       }
     });
     $('#btn-blank').addEventListener('click', A.newBlank);
+    $('#btn-newdoc').addEventListener('click', A.newDoc);
+    $('#btn-newimg').addEventListener('click', A.newImage);
+    $('#btn-newaud').addEventListener('click', () => A.newAudio());
+    $('#btn-record').addEventListener('click', () => A.newAudio({ record: true }));
+    $('#btn-newvid').addEventListener('click', A.newVideo);
+    PE.$$('[data-open]').forEach((b) => b.addEventListener('click', () => A.openKind(b.getAttribute('data-open'))));
+    $('#btn-compare').addEventListener('click', A.toggleOriginal);
+    $('#btn-orig-back').addEventListener('click', () => A.showOriginal(false));
+    $('#btn-orig-revert').addEventListener('click', A.revertToOriginal);
     $('#btn-sample').addEventListener('click', A.sample);
     $('#btn-restore').addEventListener('click', restore);
     $('#btn-restore-x').addEventListener('click', async () => {
       await PE.clearSession();
       $('#restore-card').hidden = true;
     });
-    $('#btn-download').addEventListener('click', () => A.download());
+    $('#btn-download').addEventListener('click', (e) => A.downloadMenu(e.currentTarget));
     $('#btn-pages-toggle').addEventListener('click', () => {
       if (!window.matchMedia('(max-width: 860px)').matches) {
         document.body.classList.toggle('pages-hidden');
@@ -594,20 +965,45 @@
       }
     });
     document.addEventListener('keydown', onKey);
+    document.addEventListener('keyup', (e) => mm() && !$('#modal-root').children.length && mm().onKey && mm().onKey(e));
     document.addEventListener('paste', onPaste);
     setupDrop();
     window.addEventListener('beforeunload', (e) => {
-      if (A.dirty && PE.S.pages.length) {
-        PE.autosave.flush();
+      if (A.dirty && A.hasWork()) {
+        if (mm()) {
+          /* media is too large to keep in the browser; just warn */
+        } else if (A.mode() === 'doc') PE.doc.flushAutosave();
+        else PE.autosave.flush();
         e.preventDefault();
         e.returnValue = '';
         return '';
       }
     });
     if (location.protocol === 'file:')
-      console.info('Pagewright works best from a web server (for example GitHub Pages, or `python -m http.server`).');
+      console.info('Edivora works best from a web server (for example GitHub Pages, or `python -m http.server`).');
     checkRestore();
     U.updateHistoryButtons();
+    deepLink();
+  }
+  /** links from the tool pages: ?tool=pdf highlights a card, ?new=video starts an empty project */
+  function deepLink() {
+    const q = new URLSearchParams(location.search);
+    const nw = q.get('new'),
+      tool = q.get('tool');
+    if (nw === 'word') return A.newDoc();
+    if (nw === 'image') return A.openMedia('image', [], { size: { w: 1080, h: 1080, bg: '#ffffff' } });
+    if (nw === 'audio') return A.newAudio();
+    if (nw === 'video') return A.newVideo();
+    const card = { pdf: 'pdf', word: 'docx', docx: 'docx', image: 'image', audio: 'audio', video: 'video' }[tool];
+    if (card) {
+      const el = document.querySelector(`.wl-card[data-kind="${card}"]`);
+      if (el) {
+        el.classList.add('pulse');
+        el.scrollIntoView({ block: 'center' });
+        const b = el.querySelector('[data-open]');
+        b && b.focus({ preventScroll: true });
+      }
+    }
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();

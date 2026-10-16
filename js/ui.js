@@ -1,4 +1,4 @@
-/* Pagewright — interface: properties panel, pages panel, menus, dialogs, find & replace */
+/* Edivora — interface: properties panel, pages panel, menus, dialogs, find & replace */
 'use strict';
 (function () {
   const V = PE.view,
@@ -145,10 +145,75 @@
       content = toolProps();
       active = T.tool !== 'edit';
     }
+    // phones: while typing, a single row of the most used controls instead of the full panel
+    const narrow = matchMedia('(max-width: 860px)').matches;
+    const typing = ed && (ed.kind === 'obj' || ed.kind === 'base' || ed.kind === 'cell');
+    document.body.classList.toggle('m-editing', !!(narrow && typing));
+    if (narrow && typing) {
+      const key = ed.pg + ':' + ed.id;
+      if (U._edKey !== key) {
+        U._edKey = key;
+        document.body.classList.add('m-compact');
+      }
+      content.unshift(quickBar(ed));
+    } else {
+      U._edKey = null;
+      document.body.classList.remove('m-compact');
+    }
     content.forEach((c) => c && body.appendChild(c));
     document.body.classList.toggle('props-open', active);
     if (!active) document.body.classList.remove('props-min');
   };
+  function quickBar(ed) {
+    const st = T.currentTextStyle() || T.defaults.text;
+    const keep = (e) => e.preventDefault();
+    const qb = (html, title, fn, on) =>
+      h('button', { type: 'button', class: 'qb' + (on ? ' on' : ''), title, 'aria-label': title, html, onmousedown: keep, onclick: fn });
+    const text = ed.kind !== 'cell';
+    const items = [];
+    if (text) {
+      const size = h('span', { class: 'qsize' }, String(PE.round(st.s, 1)));
+      items.push(
+        qb(icon('minus'), 'Smaller', () => T.applyTextStyle({ s: Math.max(2, PE.round(st.s - (st.s > 20 ? 2 : 1), 1)) })),
+        size,
+        qb(icon('plus'), 'Larger', () => T.applyTextStyle({ s: Math.min(400, PE.round(st.s + (st.s >= 20 ? 2 : 1), 1)) })),
+        h('i', { class: 'qsep' }),
+        qb(icon('bold'), 'Bold', () => T.applyTextStyle({ b: !st.b }), st.b),
+        qb(icon('italic'), 'Italic', () => T.applyTextStyle({ i: !st.i }), st.i),
+        qb(icon('underline'), 'Underline', () => T.applyTextStyle({ u: !st.u }), st.u),
+        qb(`<i class="qdot" style="background:${st.c}"></i>`, 'Text colour', (e) => {
+          const m = U.menu(e.currentTarget, [{ heading: 'Text colour' }]);
+          const g = h('div', { class: 'swatches' });
+          for (const c of ['#000000', '#404040', '#7f7f7f', '#ffffff', '#c00000', '#e46c0a', '#d4a017', '#2e7d32', '#1f6fb5', '#1f3864', '#7030a0', '#d61f69'])
+            g.appendChild(h('button', { class: 'sw', style: { background: c }, 'aria-label': c, onmousedown: keep, onclick: () => (U.closeMenu(), T.applyTextStyle({ c })) }));
+          m.appendChild(g);
+        }),
+        qb(icon('copy'), 'Duplicate', () => T.duplicateText())
+      );
+    }
+    const fixed = h('div', { class: 'qfix' }, [
+      qb(icon('sliders'), 'All options', () => {
+        document.body.classList.toggle('m-compact');
+        U.refreshProps();
+      }, !document.body.classList.contains('m-compact')),
+      qb(icon('check'), 'Done', () => T.stopEditing(), false),
+    ]);
+    fixed.lastChild.classList.add('qdone');
+    return h('div', { class: 'qbar' }, [h('div', { class: 'qscroll' }, items), fixed]);
+  }
+  /* keep the app the size of the visible area when the on-screen keyboard opens */
+  function trackViewport() {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const set = () => {
+      document.documentElement.style.setProperty('--vvh', Math.round(vv.height) + 'px');
+      if (document.body.classList.contains('m-editing') && vv.offsetTop) window.scrollTo(0, 0);
+      if (T.editing) T.keepCaretVisible && T.keepCaretVisible();
+    };
+    vv.addEventListener('resize', set);
+    vv.addEventListener('scroll', set);
+    set();
+  }
 
   function textProps(isBase) {
     const st = T.currentTextStyle() || T.defaults.text;
@@ -211,12 +276,27 @@
         row('Line spacing', lhSel),
       ])
     );
+    const blk = isBase && pg && PE.ex[PE.pageKey(pg)] && PE.ex[PE.pageKey(pg)].blocks.find((x) => x.id === ed.id);
+    if (blk && blk.tbl)
+      out.push(
+        sec('Table', 'table', [
+          h('p', { class: 'p-note' }, 'This text is in a table. Rows grow and borders stretch as you type. To add or remove rows and columns, turn it into an editable table.'),
+          h('div', { class: 'p-actions' }, [
+            actBtn('Edit as table', 'table', () => {
+              const id = blk.tbl;
+              T.stopEditing();
+              T.convertDetected(pg, id);
+            }),
+          ]),
+        ])
+      );
     if (isBase)
       out.push(
         sec('', null, [
           h('p', { class: 'p-note', html: 'Press <kbd>Enter</kbd> for a new line. Content below moves down as the text grows. Drag the blue handle to move the block.' }),
           h('div', { class: 'p-actions' }, [
             actBtn('Done', 'check', () => T.stopEditing()),
+            actBtn('Duplicate', 'copy', () => T.duplicateText()),
             actBtn('Restore original', 'history', () => T.restoreEditingBlock()),
             actBtn('Delete text', 'trash', () => T.deleteEditingBlock(), 'danger'),
           ]),
@@ -231,6 +311,7 @@
               T.stopEditing();
               if (e2) T.select([{ pg: e2.pg, id: e2.id }]);
             }),
+            actBtn('Duplicate', 'copy', () => T.duplicateText()),
             actBtn('Delete', 'trash', () => {
               const e2 = T.editing;
               T.stopEditing();
@@ -782,6 +863,22 @@
         onClose: (v) => res(!!v),
       });
     });
+  U.prompt = (title, label, value = '') =>
+    new Promise((res) => {
+      const inp = h('input', { class: 'field', 'aria-label': label, value });
+      const d = U.dialog({
+        title,
+        body: [h('label', { class: 'fld' }, [label, inp])],
+        actions: [
+          { label: 'Cancel', value: null },
+          { label: 'OK', primary: true, onClick: () => inp.value },
+        ],
+        onClose: (v) => res(v),
+      });
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') d.close(inp.value);
+      });
+    });
   U.askPassword = (name, retry) =>
     new Promise((res) => {
       const inp = h('input', { class: 'field', type: 'password', autocomplete: 'off', 'aria-label': 'Password', id: 'pw-input' });
@@ -810,10 +907,12 @@
 
   /* ---------- top bar ---------- */
   U.updateHistoryButtons = function () {
-    $('#btn-undo').disabled = !PE.hist.canUndo();
-    $('#btn-redo').disabled = !PE.hist.canRedo();
+    const doc = PE.doc && PE.doc.active;
+    const m = PE.mm && PE.mm.cur;
+    $('#btn-undo').disabled = m ? !m.canUndo() : doc ? !PE.doc.hist.canUndo() : !PE.hist.canUndo();
+    $('#btn-redo').disabled = m ? !m.canRedo() : doc ? !PE.doc.hist.canRedo() : !PE.hist.canRedo();
     const s = $('#save-state');
-    s.hidden = !PE.S.pages.length;
+    s.hidden = !PE.S.pages.length && !doc && !m;
     s.classList.toggle('dirty', PE.app.dirty);
     s.textContent = PE.app.dirty ? 'Unsaved changes' : 'No changes';
   };
@@ -841,16 +940,25 @@
   };
 
   U.moreMenu = function (anchor) {
+    if (PE.mm && PE.mm.cur) return mediaMoreMenu(anchor);
+    if (!PE.app.hasWork()) return homeMenu(anchor);
+    if (PE.doc && PE.doc.active) return docMoreMenu(anchor);
     const has = PE.S.pages.length > 0;
     const fields = PE.app.formFields ? Object.keys(PE.app.formFields).length : 0;
     U.menu(anchor, [
-      { label: 'Open a PDF', icon: 'open', kbd: PE.isMac ? '⌘O' : 'Ctrl+O', onClick: () => PE.app.openPicker() },
+      { label: 'Open a file', icon: 'open', kbd: PE.isMac ? '⌘O' : 'Ctrl+O', onClick: () => PE.app.openPicker() },
+      { label: 'New Word document', icon: 'word', onClick: () => PE.app.newDoc() },
       { label: 'Merge in PDFs or images', icon: 'upload', disabled: !has, onClick: () => U.insertFiles(true) },
+      '-',
+      { label: 'Make scanned pages editable (OCR)', icon: 'scan', disabled: !has, onClick: () => PE.ocr && PE.ocr.dialog() },
+      { label: 'Edit as a Word document', icon: 'convert', disabled: !has, onClick: () => PE.app.pdfToWord() },
+      { label: 'Download as Word (.docx)', icon: 'word', disabled: !has, onClick: () => PE.app.download({ format: 'docx' }) },
       '-',
       { label: 'Page numbers, header & footer', icon: 'hash', disabled: !has, onClick: () => U.headerFooterDialog() },
       { label: 'Watermark', icon: 'drop', disabled: !has, onClick: () => U.watermarkDialog() },
       { label: fields ? `Fill form fields (${fields})` : 'Fill form fields', icon: 'form', disabled: !fields, onClick: () => U.formDialog() },
       { label: 'Find and replace', icon: 'search', kbd: PE.isMac ? '⌘F' : 'Ctrl+F', disabled: !has, onClick: () => U.openFind() },
+      { label: 'Revert to original…', icon: 'history', disabled: !has, onClick: () => PE.app.revertToOriginal() },
       '-',
       { label: 'Split into separate files', icon: 'scissors', disabled: !has, onClick: () => U.splitDialog() },
       { label: 'Save current page as PNG', icon: 'image', disabled: !has, onClick: () => U.exportPng() },
@@ -863,6 +971,58 @@
       { label: 'Close document', icon: 'close', disabled: !has, onClick: () => PE.app.closeDoc() },
     ]);
   };
+
+  function newItems() {
+    return [
+      { label: 'New Word document', icon: 'word', onClick: () => PE.app.newDoc() },
+      { label: 'New image', icon: 'photo', onClick: () => PE.app.newImage() },
+      { label: 'New audio project', icon: 'music', onClick: () => PE.app.newAudio() },
+      { label: 'New video project', icon: 'video', onClick: () => PE.app.newVideo() },
+    ];
+  }
+  function homeMenu(anchor) {
+    U.menu(anchor, [
+      { label: 'Open a file', icon: 'open', kbd: PE.isMac ? '⌘O' : 'Ctrl+O', onClick: () => PE.app.openPicker() },
+      ...newItems(),
+      '-',
+      { label: 'Keyboard shortcuts', icon: 'keyboard', onClick: () => U.shortcutsDialog() },
+      { label: 'About & limits', icon: 'info', onClick: () => U.aboutDialog() },
+    ]);
+  }
+  function mediaMoreMenu(anchor) {
+    const m = PE.mm.cur;
+    U.menu(anchor, [
+      { label: 'Open a file', icon: 'open', kbd: PE.isMac ? '⌘O' : 'Ctrl+O', onClick: () => PE.app.openPicker() },
+      '-',
+      ...(m.moreItems ? m.moreItems() : []),
+      '-',
+      { label: 'Keyboard shortcuts', icon: 'keyboard', onClick: () => U.shortcutsDialog() },
+      { label: 'About & limits', icon: 'info', onClick: () => U.aboutDialog() },
+      '-',
+      { label: 'Close ' + m.label.toLowerCase(), icon: 'close', onClick: () => PE.app.closeDoc() },
+    ]);
+  }
+
+  function docMoreMenu(anchor) {
+    const Doc = PE.doc;
+    U.menu(anchor, [
+      { label: 'Open a file', icon: 'open', kbd: PE.isMac ? '⌘O' : 'Ctrl+O', onClick: () => PE.app.openPicker() },
+      { label: 'New Word document', icon: 'word', onClick: () => PE.app.newDoc() },
+      '-',
+      { label: 'Download as Word (.docx)', icon: 'word', onClick: () => PE.app.download({ format: 'docx' }) },
+      { label: 'Download as PDF', icon: 'file', onClick: () => PE.app.download({ format: 'pdf' }) },
+      { label: 'Open in the PDF editor (sign, draw, merge…)', icon: 'convert', onClick: () => PE.app.wordToPdfEditor() },
+      '-',
+      { label: Doc.D && Doc.D.pageNumbers ? 'Remove page numbers' : 'Add page numbers', icon: 'hash', disabled: !!(Doc.D && Doc.D.ftr.default) && !(Doc.D && Doc.D.pageNumbers), onClick: () => Doc.togglePageNumbers() },
+      { label: Doc.web ? 'Page view' : 'Mobile view (fit text to screen)', icon: 'pages', onClick: () => Doc.setLayout(!Doc.web) },
+      { label: 'Zoom to fit width', icon: 'fit', onClick: () => Doc.fitWidth() },
+      { label: 'Revert to original…', icon: 'history', onClick: () => PE.app.revertToOriginal() },
+      { label: 'Keyboard shortcuts', icon: 'keyboard', onClick: () => U.shortcutsDialog() },
+      { label: 'About & limits', icon: 'info', onClick: () => U.aboutDialog() },
+      '-',
+      { label: 'Close document', icon: 'close', onClick: () => PE.app.closeDoc() },
+    ]);
+  }
 
   /* ---------- thumbnails ---------- */
   const thumbCache = new Map(); // pageId -> {el, key}
@@ -1762,10 +1922,11 @@
 
   U.shortcutsDialog = function () {
     const k = PE.isMac ? '⌘' : 'Ctrl+';
-    const list = [
+    const m = PE.mm && PE.mm.cur;
+    const list = m && m.shortcuts ? m.shortcuts(k) : [
       ['Undo / Redo', `${k}Z / ${k}Shift+Z`],
-      ['Download PDF', `${k}S`],
-      ['Open PDF', `${k}O`],
+      ['Download', `${k}S`],
+      ['Open a file', `${k}O`],
       ['Find and replace', `${k}F`],
       ['Zoom in / out', `${k}+ / ${k}−`],
       ['Edit tool / Text tool', 'V / T'],
@@ -1779,6 +1940,9 @@
       ['New line while editing', 'Enter'],
       ['Finish editing', 'Esc'],
       ['Next table cell', 'Tab'],
+      ['Word: page break', `${k}Enter`],
+      ['Word: align left / centre / right / justify', `${k}L / ${k}E / ${k}R / ${k}J`],
+      ['Word: line break in a paragraph', 'Shift+Enter'],
     ];
     U.dialog({
       title: 'Keyboard shortcuts',
@@ -1789,12 +1953,15 @@
 
   U.aboutDialog = function () {
     U.dialog({
-      title: 'About Pagewright',
+      title: 'About Edivora',
       wide: true,
       body: [
-        h('p', {}, 'Pagewright runs entirely in your browser. PDFs are read with pdf.js and written with pdf-lib; nothing is uploaded anywhere. Unsaved work is kept in this browser so a refresh does not lose it.'),
+        h('p', {}, 'Edivora runs entirely in your browser. PDFs are read with pdf.js and written with pdf-lib, Word files are read and written directly, and scanned pages are recognised with Tesseract. Nothing is uploaded anywhere. Unsaved work is kept in this browser so a refresh does not lose it.'),
         h('p', {}, 'How text editing works: the editor finds paragraphs in the PDF and matches each font to the closest bundled font (Arial, Calibri, Times, Cambria, Courier, Roboto, Open Sans, Lato, Montserrat, Poppins, plus Tamil and Devanagari). Edited paragraphs are redrawn in that font over the original, and content below moves down when a paragraph grows.'),
-        h('p', {}, 'Limits to know: fonts that are not in the list are replaced by the closest look-alike. Lines and boxes drawn in the PDF (such as table borders) stay where they are when text moves. Whiteout hides content but leaves it in the file; Redact removes it by saving that page as an image. Password-protected PDFs are saved as images.'),
+        h('p', {}, 'Tables: when text in a table cell grows, its row gets taller, the borders stretch and everything below moves down. Use “Edit as table” to add or remove rows and columns.'),
+        h('p', {}, 'Images, audio and video are edited with the browser’s own graphics and sound engines (canvas, WebGL, Web Audio, WebCodecs). Pictures keep full resolution up to 8192 pixels a side. Audio exports as WAV or MP3. Video exports as MP4 or WebM where the browser can encode it (Chrome and Edge do it fastest; other browsers record the video in real time), and as animated GIF.'),
+        h('p', {}, 'Word documents: text flows across pages like in Word. Styles, headers, footers and anything you do not change are kept when you save as .docx. Floating pictures and text boxes are shown in line with the text.'),
+        h('p', {}, 'Limits to know: fonts that are not in the list are replaced by the closest look-alike. Curved drawings in a PDF stay where they are when text moves. Whiteout hides content but leaves it in the file; Redact removes it by saving that page as an image. Password-protected PDFs are saved as images. PDF → Word conversion rebuilds the layout from the text, tables and pictures it finds.'),
       ],
       actions: [{ label: 'Close', primary: true, value: null }],
     });
@@ -1845,7 +2012,7 @@
     const norm = (s) => (cs ? s : s.toLowerCase());
     const nq = norm(q);
     for (const pg of PE.S.pages) {
-      const ex = pg.src.t === 'pdf' && PE.ex[PE.pageKey(pg)];
+      const ex = PE.ex[PE.pageKey(pg)];
       const targets = [];
       if (ex) for (const b of ex.blocks) if (!(pg.ov[b.id] && pg.ov[b.id].del)) targets.push(['base', b.id]);
       for (const o of pg.objs) if (o.type === 'text') targets.push(['obj', o.id]);
@@ -1945,12 +2112,18 @@
     themeIcon();
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', themeIcon);
     $('#btn-theme').addEventListener('click', U.toggleTheme);
-    $('#btn-undo').addEventListener('click', () => PE.undo());
-    $('#btn-redo').addEventListener('click', () => PE.redo());
-    $('#btn-zoom-in').addEventListener('click', () => V.setZoom(V.zoom * 1.2));
-    $('#btn-zoom-out').addEventListener('click', () => V.setZoom(V.zoom / 1.2));
+    const docOn = () => PE.doc && PE.doc.active;
+    const mm = () => PE.mm && PE.mm.cur;
+    $('#btn-undo').addEventListener('click', () => (mm() ? mm().undo() : docOn() ? PE.doc.undo() : PE.undo()));
+    $('#btn-redo').addEventListener('click', () => (mm() ? mm().redo() : docOn() ? PE.doc.redo() : PE.redo()));
+    $('#btn-zoom-in').addEventListener('click', () => (mm() ? mm().zoomIn() : docOn() ? PE.doc.setZoom(PE.doc.zoom * 1.15) : V.setZoom(V.zoom * 1.2)));
+    $('#btn-zoom-out').addEventListener('click', () => (mm() ? mm().zoomOut() : docOn() ? PE.doc.setZoom(PE.doc.zoom / 1.15) : V.setZoom(V.zoom / 1.2)));
     $('#btn-zoom').addEventListener('click', (e) =>
-      U.menu(e.currentTarget, [
+      mm()
+        ? mm().zoomMenu(e.currentTarget)
+        : docOn()
+        ? U.menu(e.currentTarget, [{ label: 'Fit width', icon: 'fit', onClick: () => PE.doc.fitWidth() }, '-', ...[50, 75, 100, 125, 150, 200].map((z) => ({ label: z + '%', on: Math.round(PE.doc.zoom * 100) === z, onClick: () => PE.doc.setZoom(z / 100) }))])
+        : U.menu(e.currentTarget, [
         { label: 'Fit width', icon: 'fit', onClick: () => V.fitWidth() },
         { label: 'Fit page', icon: 'file', onClick: () => V.fitPage() },
         '-',
@@ -1965,7 +2138,14 @@
       if (document.body.classList.contains('pages-open') && !e.target.closest('#pages-panel') && !e.target.closest('#btn-pages-toggle') && !e.target.closest('.menu') && !e.target.closest('.modal-veil'))
         document.body.classList.remove('pages-open');
     });
-    $('#props-handle').addEventListener('click', () => document.body.classList.toggle('props-min'));
+    $('#props-handle').addEventListener('click', () => {
+      if (document.body.classList.contains('m-editing')) {
+        document.body.classList.toggle('m-compact');
+        return U.refreshProps();
+      }
+      document.body.classList.toggle('props-min');
+    });
+    trackViewport();
     PE.$$('#toolrail .tool').forEach((b) => b.addEventListener('click', () => railClick(b)));
     PE.$$('[data-page]').forEach((b) => b.addEventListener('click', () => U.pageOp(b.getAttribute('data-page'))));
     // find bar

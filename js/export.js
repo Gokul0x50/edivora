@@ -1,4 +1,4 @@
-/* Pagewright — builds the final PDF with pdf-lib
+/* Edivora — builds the final PDF with pdf-lib
  * Pages are copied from the original files (text stays vector and selectable), edits are drawn on top.
  * Text positions come from the browser's own layout of the same fonts, so the file matches the screen.
  */
@@ -365,9 +365,10 @@
   /** Make sure every page with edits has its PDF content read and laid out. */
   async function prepare(pages) {
     for (const pg of pages) {
-      const needs = pg.src.t === 'pdf' && Object.keys(pg.ov).length;
+      const needs = (pg.src.t === 'pdf' && (Object.keys(pg.ov).length || (PE.S.ocr && PE.S.ocr[PE.pageKey(pg)]))) || (pg.src.t === 'img' && Object.keys(pg.ov).length);
       if (needs) {
-        await PE.extractPage(pg.src.doc, pg.src.i);
+        if (pg.src.t === 'pdf') await PE.extractPage(pg.src.doc, pg.src.i);
+        else PE.ocr && PE.ocr.ensureImageEx(pg);
         V.renderOverlay(pg);
       }
     }
@@ -454,14 +455,17 @@
 
       const pv = V.els.get(pg.id);
       // cover original content that was edited, moved or deleted
-      if (mode === 'pdf' || mode === 'raster') {
+      if (mode === 'pdf' || mode === 'raster' || mode === 'img') {
         const rects = V.coverRects(pg);
         if (rects.length) {
           push(page, PE.M.mul(B2U, PE.M.sc(1, -1)));
-          for (const r of rects) page.drawRectangle({ x: r.x, y: -(r.y + r.h), width: r.w, height: r.h, color: PE.pdfColor(r.c || '#ffffff') });
+          for (const r of rects) {
+            if (r.a) page.drawImage(await image(ctx, r.a), { x: r.x, y: -(r.y + r.h), width: r.w, height: r.h });
+            else page.drawRectangle({ x: r.x, y: -(r.y + r.h), width: r.w, height: r.h, color: PE.pdfColor(r.c || '#ffffff') });
+          }
           pop(page);
         }
-        const ex = pg.src.t === 'pdf' && PE.ex[PE.pageKey(pg)];
+        const ex = (pg.src.t === 'pdf' || pg.src.t === 'img') && PE.ex[PE.pageKey(pg)];
         if (ex && pv && pv.baseEls) {
           const shift = pv.shift || {};
           for (const im of ex.images) {
@@ -473,13 +477,12 @@
             const a = (ov && ov.a) || (await V.ensureBaseImageAsset(pg, im));
             await drawObj(ctx, page, B2U, pg, { type: 'image', a, x: g.x, y: g.y, w: g.w, h: g.h, rot: g.rot, flipX: g.flipX, flipY: g.flipY });
           }
-          const moved = (ex.graphics || []).filter((g) => shift[g.id] && !(pg.ov[g.id] && pg.ov[g.id].del));
-          if (moved.length) {
+          const gpos = pv.gpos || {};
+          if (Object.keys(gpos).length) {
             push(page, PE.M.mul(B2U, PE.M.sc(1, -1)));
-            for (const g of moved) {
-              const sh = shift[g.id];
-              if (g.k === 'rect') page.drawRectangle({ x: g.x, y: -(g.y + sh + g.h), width: g.w, height: g.h, color: PE.pdfColor(g.c) });
-              else page.drawLine({ start: { x: g.x1, y: -(g.y1 + sh) }, end: { x: g.x2, y: -(g.y2 + sh) }, thickness: g.lw, color: PE.pdfColor(g.c) });
+            for (const id in gpos) {
+              const r = gpos[id];
+              page.drawRectangle({ x: r.x, y: -(r.y + r.h), width: r.w, height: r.h, color: PE.pdfColor(r.c) });
             }
             pop(page);
           }
@@ -490,6 +493,15 @@
             if (!el || !el.classList.contains('mat')) continue;
             await drawTextEl(ctx, page, B2U, el, { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight }, 0);
           }
+          // recognised text that wasn't edited: invisible, so the saved PDF can be searched and copied
+          if (PE.ocr && mode !== 'raster')
+            for (const b of ex.blocks)
+              if (b.ocr && !pg.ov[b.id] && !shift[b.id])
+                try {
+                  await PE.ocr.drawInvisible(page, B2U, b, (id) => font(ctx, id));
+                } catch (e) {
+                  console.warn('ocr text layer', e);
+                }
         }
       }
       for (const o of pg.objs) await drawObj(ctx, page, B2U, pg, o, pv && pv.objs.querySelector(`[data-oid="${o.id}"]`));
@@ -508,7 +520,7 @@
     const meta = PE.S.meta;
     if (meta.title) out.setTitle(meta.title);
     if (meta.author) out.setAuthor(meta.author);
-    out.setProducer('Pagewright PDF editor');
+    out.setProducer('Edivora');
     out.setModificationDate(new Date());
     if (typeof out.flush === 'function') await out.flush();
     collectGarbage(out);
@@ -581,6 +593,9 @@
     }
     for (const [ref] of ctx.enumerateIndirectObjects()) if (!seen.has(ref.tag)) ctx.delete(ref);
   }
+
+  // shared with the Word document export
+  PE.exportKit = { font, coverage, drawSegs, push, pop, ZW };
 
   /* ---------- images of pages ---------- */
   PE.renderPdfBytesPage = async function (bytes, index, scale) {

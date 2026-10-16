@@ -1,4 +1,4 @@
-/* Pagewright — reads a PDF page's text and images into editable blocks
+/* Edivora — reads a PDF page's text and images into editable blocks
  * Text items from pdf.js are grouped into lines, then into paragraph blocks.
  * Each block keeps per-run font family / weight / italic / size / colour so editing
  * continues in the same style. Colours and the background behind each block are sampled
@@ -7,6 +7,7 @@
 'use strict';
 (function () {
   const pending = {};
+  const PUA = { '\uf0b7': '•', '\uf0a7': '▪', '\uf0a8': '□', '\uf0d8': '➢', '\uf076': '❖', '\uf0fc': '✓', '\uf0e0': '➔', '\uf06e': '■', '\uf0a1': '○' };
   const SAMPLE_SCALE = 2;
 
   PE.extractPage = function (docId, i) {
@@ -15,7 +16,7 @@
     if (pending[key]) return pending[key];
     pending[key] = run(docId, i)
       .then((ex) => {
-        PE.ex[key] = ex;
+        PE.ex[key] = PE.ocr ? PE.ocr.mergeInto(key, ex) : ex;
         delete pending[key];
         return ex;
       })
@@ -68,17 +69,16 @@
       let desc = style.descent ? -style.descent : 0.21;
       asc = PE.clamp(asc, 0.6, 1.05);
       desc = PE.clamp(desc, 0.12, 0.35);
+      // bullets from Symbol / Wingdings fonts sit in the private-use area; use the real characters
+      const str = it.str.replace(/[\uf0b7\uf0a7\uf0a8\uf0d8\uf076\uf0fc\uf0e0\uf06e\uf0a1]/g, (ch) => PUA[ch] || '•');
       const w = it.width; // already in page units at scale 1
       if (!(w > 0)) continue;
       const x = tx[4],
         y = tx[5];
       const box = { x, y: y - asc * size, w, h: (asc + desc) * size };
       const color = sampler.ink(box);
-      items.push({ str: it.str, x, y, w, size, asc, desc, fm, color });
+      items.push({ str, x, y, w, size, asc, desc, fm, color });
     }
-
-    const lines = buildLines(items);
-    const blocks = buildBlocks(lines, sampler);
 
     // ---------- images and simple vector graphics (rules, table lines, boxes) ----------
     const images = [];
@@ -157,9 +157,24 @@
     } catch (e) {
       console.warn('image scan failed', e);
     }
-    for (const g of graphics) g.bg = sampler.ring({ x: g.x, y: g.y, w: g.w, h: g.h });
-    graphics.forEach((g, i) => (g.id = 'g' + i));
-    return { W, H, blocks, images, graphics: graphics.slice(0, 1500), preds: null };
+    graphics.length = Math.min(graphics.length, 1500);
+    graphics.forEach((g, i) => {
+      g.id = 'g' + i;
+      g.bg = sampler.ring({ x: g.x, y: g.y, w: g.w, h: g.h });
+    });
+
+    // tables: grids of ruling lines / cell fills. Their lines also keep text of neighbouring cells apart.
+    const cand = detectTables(graphics, W, H);
+    const seps = { v: [], h: [], open: cand.filter((T) => T.xs.length < 2) };
+    for (const T of cand) {
+      seps.v.push(...T.vs);
+      seps.h.push(...T.hs);
+    }
+    const lines = buildLines(items, seps);
+    const blocks = buildBlocks(lines, sampler, seps);
+    const tables = assignTables(cand, blocks, images, graphics);
+    for (const T of tables) T.bg = sampler.ring({ x: T.x - 2, y: T.y - 2, w: T.w + 4, h: T.h + 4 });
+    return { W, H, blocks, images, graphics, tables, preds: null };
   }
 
   /** collect the segments of a path in page coordinates; only straight, axis-aligned pieces are kept */
@@ -302,7 +317,8 @@
             }
           }
         if (!cand.length) return bg[0] + bg[1] + bg[2] > 380 ? '#000000' : '#ffffff';
-        const strong = cand.filter((c) => c[1] >= maxD * 0.72).map((c) => c[0]);
+        // small glyphs are mostly anti-aliased edge pixels: trust only the strongest ones
+        const strong = cand.filter((c) => c[1] >= maxD * (cand.length < 120 ? 0.9 : 0.72)).map((c) => c[0]);
         const c = dominant(strong);
         // snap near-black to pure black (anti-aliasing leaves it slightly grey)
         if (c[0] < 40 && c[1] < 40 && c[2] < 40 && Math.abs(c[0] - c[1]) < 12 && Math.abs(c[1] - c[2]) < 12) return '#000000';
@@ -337,7 +353,10 @@
     else runs.push(r);
   }
 
-  function buildLines(items) {
+  function buildLines(items, seps) {
+    const vs = (seps && seps.v) || [];
+    // a table's vertical rule between two pieces of text on the same line keeps them in separate cells
+    const ruled = (x0, x1, y, size) => vs.some((v) => v.x >= x0 - 1 && v.x <= x1 + 1 && v.y1 <= y && v.y2 >= y - size * 0.5);
     items.sort((a, b) => a.y - b.y || a.x - b.x);
     const rows = [];
     for (const it of items) {
@@ -377,7 +396,7 @@
           const gap = it.x - cur.right;
           // repeated glyphs used to fake bold / shadows
           if (prev && it.str === prev.str && Math.abs(it.x - prev.x) < sz * 0.4) continue;
-          if (gap > 1.25 * sz) flush();
+          if (gap > 1.25 * sz || (vs.length && gap > -0.5 && ruled(cur.right, it.x, row.y, sz))) flush();
           else if (gap > 0.13 * Math.min(cur.size, it.size)) {
             const lr = cur.runs[cur.runs.length - 1];
             if (lr && !/\s$/.test(lr.t) && !/^\s/.test(it.str)) lr.t += ' ';
@@ -437,9 +456,20 @@
   /* ---------- lines -> blocks (paragraphs) ---------- */
   const BULLET = /^\s*([•▪●◦‣∙·\-–—*■□➢➤✓✔]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|[ivxIVX]{1,4}[.)])\s/;
 
-  function buildBlocks(lines, sampler) {
+  function buildBlocks(lines, sampler, seps) {
+    const hs = (seps && seps.h) || [];
+    // a table's horizontal rule between two lines keeps them in separate cells
+    const ruledH = (last, ln) =>
+      hs.some((h) => h.y > last.y + 0.1 * last.size && h.y < ln.y - 0.5 * ln.size && Math.min(h.x2, ln.right) - Math.max(h.x1, ln.x) > 0);
     lines = lines.filter((l) => l.runs.length);
     lines.sort((a, b) => a.top - b.top || a.x - b.x);
+    // in tables without cell borders, a line that shares its baseline with another cell is a table row
+    const open = (seps && seps.open) || [];
+    if (open.length)
+      for (const ln of lines) {
+        const T = open.find((t) => ln.x >= t.x - 2 && ln.right <= t.x + t.w + 2 && ln.y > t.y && ln.y < t.y + t.h);
+        if (T) ln.sib = lines.some((o) => o !== ln && Math.abs(o.y - ln.y) < 0.3 * ln.size && o.x >= T.x - 2 && o.right <= T.x + T.w + 2) ? T : null;
+      }
     const blocks = [];
     for (const ln of lines) {
       let target = null;
@@ -459,6 +489,8 @@
         const leftAligned = Math.abs(ln.x - b.x) < 0.9 * sz;
         const centered = Math.abs((ln.x + ln.right) / 2 - (b.x + b.right) / 2) < 1.2 * sz && ov > 0;
         if (!(leftAligned || centered || ov > 0.6 * minW)) continue;
+        if (hs.length && ruledH(last, ln)) continue;
+        if (ln.sib && last.sib === ln.sib) continue;
         target = b;
         break;
       }
@@ -643,16 +675,194 @@
     return { assetId: id, cropped };
   };
 
-  /** Immediate-predecessor graph used to push content down when a block grows. */
-  PE.buildPreds = function (ex) {
-    if (ex.preds) return ex.preds;
-    const els = [];
-    for (const b of ex.blocks) els.push({ id: b.id, l: b.x, r: b.x + b.w, t: b.top, btm: b.top + b.h });
-    for (const im of ex.images) {
-      if (im.bbox.w > ex.W * 0.9 && im.bbox.h > ex.H * 0.9) continue; // page backgrounds don't move
-      els.push({ id: im.id, l: im.bbox.x, r: im.bbox.x + im.bbox.w, t: im.bbox.y, btm: im.bbox.y + im.bbox.h });
+  /* ---------- tables ---------- */
+  function cluster(vals, tol) {
+    vals = vals.slice().sort((a, b) => a - b);
+    const out = [];
+    let grp = [];
+    for (const v of vals) {
+      if (grp.length && v - grp[grp.length - 1] > tol) {
+        out.push(grp.reduce((a, b) => a + b, 0) / grp.length);
+        grp = [];
+      }
+      grp.push(v);
     }
-    for (const g of ex.graphics || []) els.push({ id: g.id, l: g.x, r: g.x + Math.max(g.w, 0.6), t: g.y, btm: g.y + Math.max(g.h, 0.6), g: true });
+    if (grp.length) out.push(grp.reduce((a, b) => a + b, 0) / grp.length);
+    return out;
+  }
+
+  /** find grids of horizontal/vertical rules and cell fills that touch each other */
+  function detectTables(graphics, W, H) {
+    const el = [];
+    for (const g of graphics) {
+      let kind = null,
+        seg = null;
+      if (g.k === 'line') {
+        if (Math.abs(g.y1 - g.y2) < 0.5 && Math.abs(g.x2 - g.x1) > 2) {
+          kind = 'h';
+          seg = { y: (g.y1 + g.y2) / 2, x1: Math.min(g.x1, g.x2), x2: Math.max(g.x1, g.x2) };
+        } else if (Math.abs(g.x1 - g.x2) < 0.5 && Math.abs(g.y2 - g.y1) > 2) {
+          kind = 'v';
+          seg = { x: (g.x1 + g.x2) / 2, y1: Math.min(g.y1, g.y2), y2: Math.max(g.y1, g.y2) };
+        }
+      } else if (g.h <= 3 && g.w > 2 * g.h && g.w > 2) {
+        kind = 'h';
+        seg = { y: g.y + g.h / 2, x1: g.x, x2: g.x + g.w };
+      } else if (g.w <= 3 && g.h > 2 * g.w && g.h > 2) {
+        kind = 'v';
+        seg = { x: g.x + g.w / 2, y1: g.y, y2: g.y + g.h };
+      } else if (g.w > 3 && g.h > 3) kind = 'f';
+      if (kind) el.push({ g, kind, seg, l: g.x, t: g.y, r: g.x + g.w, b: g.y + g.h });
+    }
+    if (!el.length || el.length > 2500) return [];
+    // connected groups of touching pieces
+    const par = el.map((_, k) => k);
+    const find = (k) => (par[k] === k ? k : (par[k] = find(par[k])));
+    const order = el.map((_, k) => k).sort((a, b) => el[a].l - el[b].l);
+    const tol = 1.5;
+    for (let a = 0; a < order.length; a++) {
+      const A = el[order[a]];
+      for (let b = a + 1; b < order.length; b++) {
+        const B = el[order[b]];
+        if (B.l > A.r + tol) break;
+        if (B.t <= A.b + tol && B.b >= A.t - tol) {
+          const ra = find(order[a]),
+            rb = find(order[b]);
+          if (ra !== rb) par[ra] = rb;
+        }
+      }
+    }
+    const groups = new Map();
+    el.forEach((e, k) => {
+      const r = find(k);
+      if (!groups.has(r)) groups.set(r, []);
+      groups.get(r).push(e);
+    });
+    // tables drawn with horizontal rules only (no cell borders): stacked rules of the same width
+    const lone = [...groups.values()].filter((m) => m.length <= 2 && m.every((e) => e.kind === 'h')).map((m) => m[0]);
+    lone.sort((a, b) => a.seg.y - b.seg.y);
+    const used = new Set();
+    for (let a = 0; a < lone.length; a++) {
+      if (used.has(a)) continue;
+      const chain = [a];
+      let last = lone[a];
+      for (let b = a + 1; b < lone.length; b++) {
+        const e = lone[b];
+        if (used.has(b) || Math.abs(e.seg.x1 - last.seg.x1) > 3 || Math.abs(e.seg.x2 - last.seg.x2) > 3) continue;
+        if (e.seg.y - last.seg.y > 120) break;
+        if (e.seg.y - last.seg.y < 6) continue;
+        chain.push(b);
+        last = e;
+      }
+      if (chain.length < 3 || last.seg.x2 - last.seg.x1 < 60) continue;
+      const merged = [];
+      for (const k of chain) {
+        used.add(k);
+        const root = find(el.indexOf(lone[k]));
+        merged.push(...groups.get(root));
+        groups.delete(root);
+      }
+      groups.set('r' + a, merged);
+    }
+    let tables = [];
+    for (const m of groups.values()) {
+      const hs = m.filter((e) => e.kind === 'h'),
+        vs = m.filter((e) => e.kind === 'v'),
+        fs = m.filter((e) => e.kind === 'f');
+      const x = Math.min(...m.map((e) => e.l)),
+        y = Math.min(...m.map((e) => e.t)),
+        r = Math.max(...m.map((e) => e.r)),
+        b = Math.max(...m.map((e) => e.b));
+      if (r - x < 20 || b - y < 8) continue;
+      const xs = cluster(vs.map((e) => e.seg.x), tol);
+      let ys = cluster(hs.map((e) => e.seg.y).concat(fs.flatMap((e) => [e.t, e.b])), tol);
+      const ok = (ys.length >= 2 && (xs.length >= 2 || fs.length >= 1)) || ys.length >= 3;
+      if (!ok) continue;
+      if ((r - x) * (b - y) > 0.75 * W * H && ys.length <= 2) continue; // a frame around the page
+      ys = cluster(ys.concat([y, b]), tol);
+      tables.push({
+        x,
+        y,
+        w: r - x,
+        h: b - y,
+        ys,
+        xs,
+        simple: ys.length <= 2 && xs.length <= 2,
+        vs: vs.map((e) => e.seg),
+        hs: hs.map((e) => e.seg).concat(fs.flatMap((e) => [{ y: e.t, x1: e.l, x2: e.r }, { y: e.b, x1: e.l, x2: e.r }])),
+        gids: m.map((e) => e.g.id),
+      });
+    }
+    const inside = (U, T) => U !== T && U.x >= T.x - 1 && U.y >= T.y - 1 && U.x + U.w <= T.x + T.w + 1 && U.y + U.h <= T.y + T.h + 1;
+    // plain boxes inside a table are just part of a cell; a box around a table is not a table itself
+    tables = tables.filter((U) => !(U.simple && tables.some((T) => !T.simple && inside(U, T))));
+    tables = tables.filter((T) => !tables.some((U) => inside(U, T)));
+    return tables;
+  }
+
+  /** attach text, images and other graphics to the table rows they sit in */
+  function assignTables(cand, blocks, images, graphics) {
+    const out = [];
+    const taken = new Set();
+    for (const T of cand) {
+      const n = T.ys.length - 1;
+      const inT = (cx, cy) => cx > T.x - 0.5 && cx < T.x + T.w + 0.5 && cy > T.y - 0.5 && cy < T.y + T.h + 0.5;
+      const rowOf = (cy) => {
+        let r = 0;
+        while (r < n - 1 && cy > T.ys[r + 1]) r++;
+        return r;
+      };
+      const bl = blocks.filter((b) => !taken.has(b.id) && inT(b.x + b.w / 2, b.top + b.h / 2));
+      if (!bl.length) continue;
+      T.id = 'T' + out.length;
+      T.mem = [];
+      const gset = new Set(T.gids);
+      for (const b of bl) {
+        taken.add(b.id);
+        const cy = b.top + b.h / 2;
+        const row = rowOf(cy);
+        // the cell this text sits in: nearest vertical rules on each side
+        const cover = (v) => v.y1 <= cy + 1 && v.y2 >= cy - 1;
+        let left = T.x,
+          right = T.x + T.w;
+        for (const v of T.vs) {
+          if (!cover(v)) continue;
+          if (v.x <= b.x + 1) left = Math.max(left, v.x);
+          if (v.x >= b.x + b.w - 1) right = Math.min(right, v.x);
+        }
+        // tables without vertical rules: stop before the next text on the same row
+        for (const o of bl)
+          if (o !== b && o.x > b.x + b.w - 1 && Math.min(o.top + o.h, b.top + b.h) - Math.max(o.top, b.top) > 0) right = Math.min(right, o.x - 6);
+        const pad = PE.clamp(b.x - left, 1.5, 12);
+        b.tbl = T.id;
+        b.maxR = Math.max(b.x + b.w, right - pad);
+        // inside of the cell (covers for edited text must not hide the cell's borders)
+        b.cell = { l: left + 0.8, t: T.ys[row] + 0.8, r: right - 0.8, b: T.ys[row + 1] - 0.8 };
+        T.mem.push({ id: b.id, row, l: b.x, r: b.x + b.w, t: b.top, btm: b.top + b.h, gap: T.ys[row + 1] - (b.top + b.h) });
+      }
+      for (const im of images) {
+        const bb = im.bbox;
+        if (taken.has(im.id) || !inT(bb.x + bb.w / 2, bb.y + bb.h / 2) || bb.w > T.w * 0.98) continue;
+        taken.add(im.id);
+        const row = rowOf(bb.y + bb.h / 2);
+        T.mem.push({ id: im.id, row, l: bb.x, r: bb.x + bb.w, t: bb.y, btm: bb.y + bb.h, gap: T.ys[row + 1] - (bb.y + bb.h) });
+      }
+      for (const g of graphics) {
+        if (gset.has(g.id) || taken.has(g.id)) continue;
+        if (g.x >= T.x - 1 && g.y >= T.y - 1 && g.x + g.w <= T.x + T.w + 1 && g.y + g.h <= T.y + T.h + 1) {
+          taken.add(g.id);
+          T.mem.push({ id: g.id, row: rowOf(g.y + g.h / 2), l: g.x, r: g.x + Math.max(g.w, 0.6), t: g.y, btm: g.y + Math.max(g.h, 0.6), g: true });
+        }
+      }
+      for (const id of T.gids) taken.add(id);
+      delete T.simple;
+      out.push(T);
+    }
+    return out;
+  }
+
+  /** immediate-predecessor graph: for each element, the elements directly above it that it would be pushed by */
+  function graph(els) {
     els.sort((a, b) => a.t - b.t);
     const ov = (a, b) => Math.min(a.r, b.r) - Math.max(a.l, b.l) > 0.3;
     const preds = {};
@@ -671,8 +881,43 @@
       }
       preds[e.id] = res;
     }
-    ex.order = els.map((e) => e.id);
-    ex.preds = preds;
-    return preds;
+    return { order: els.map((e) => e.id), preds };
+  }
+
+  /** Predecessor graphs used to push content down when a block grows.
+   *  Each table is one element of the page graph; inside it every row has its own small graph. */
+  PE.buildPreds = function (ex) {
+    if (ex.preds) return ex.preds;
+    const tables = ex.tables || [];
+    const inTable = new Set();
+    for (const T of tables) {
+      for (const m of T.mem) inTable.add(m.id);
+      for (const id of T.gids) inTable.add(id);
+    }
+    const els = [];
+    for (const b of ex.blocks) if (!inTable.has(b.id)) els.push({ id: b.id, l: b.x, r: b.x + b.w, t: b.top, btm: b.top + b.h });
+    for (const im of ex.images) {
+      if (inTable.has(im.id)) continue;
+      if (im.bbox.w > ex.W * 0.9 && im.bbox.h > ex.H * 0.9) continue; // page backgrounds don't move
+      els.push({ id: im.id, l: im.bbox.x, r: im.bbox.x + im.bbox.w, t: im.bbox.y, btm: im.bbox.y + im.bbox.h });
+    }
+    for (const g of ex.graphics || [])
+      if (!inTable.has(g.id)) els.push({ id: g.id, l: g.x, r: g.x + Math.max(g.w, 0.6), t: g.y, btm: g.y + Math.max(g.h, 0.6) });
+    for (const T of tables) els.push({ id: T.id, l: T.x, r: T.x + T.w, t: T.y, btm: T.y + T.h });
+    const G = graph(els);
+    for (const T of tables) {
+      T.rowGraphs = [];
+      for (let r = 0; r < T.ys.length - 1; r++) {
+        const rowEls = T.mem.filter((m) => m.row === r).map((m) => Object.assign({}, m));
+        const gr = graph(rowEls);
+        gr.els = rowEls;
+        const gaps = rowEls.filter((m) => !m.g).map((m) => m.gap);
+        gr.minGap = gaps.length ? Math.min(...gaps) : 0;
+        T.rowGraphs.push(gr);
+      }
+    }
+    ex.order = G.order;
+    ex.preds = G.preds;
+    return ex.preds;
   };
 })();

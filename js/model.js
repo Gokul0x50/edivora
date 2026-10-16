@@ -1,4 +1,4 @@
-/* Pagewright — document model, undo/redo history, autosave
+/* Edivora — document model, undo/redo history, autosave
  *
  * State (PE.S) is plain JSON so it can be snapshotted for undo/redo:
  *  pages: [{ id, src, rot, objs:[], ov:{} }]
@@ -49,11 +49,12 @@
     wm: PE.defaultWM(),
     meta: { title: '', author: '' },
     form: {},
+    ocr: {}, // page key -> paragraphs recognised in a scanned page
   });
   PE.S = PE.newState();
 
   /* ---------- page geometry ---------- */
-  PE.pageKey = (pg) => (pg.src.t === 'pdf' ? pg.src.doc + ':' + pg.src.i : null);
+  PE.pageKey = (pg) => (pg.src.t === 'pdf' ? pg.src.doc + ':' + pg.src.i : pg.src.t === 'img' ? 'img:' + pg.src.a : null);
   PE.baseSize = (pg) => {
     if (pg.src.t === 'pdf') {
       const d = PE.docs[pg.src.doc];
@@ -156,6 +157,10 @@
     PE.commitSoon.cancel();
     H.idx = i;
     PE.S = JSON.parse(H.stack[i]);
+    if (!PE.S.ocr) PE.S.ocr = {};
+    // recognised text belongs to the state: refresh the pages' content to match
+    for (const key in PE.ex) if (PE.ex[key] && !PE.ex[key].failed && PE.ocr) PE.ocr.mergeInto(key, PE.ex[key]);
+    for (const key in PE.ex) if (key.startsWith('img:') && !PE.S.ocr[key]) delete PE.ex[key];
     PE.tools && PE.tools.clearSelection(true);
     PE.view.sync();
     PE.markDirty();

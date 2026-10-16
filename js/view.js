@@ -1,4 +1,4 @@
-/* Pagewright — page views: canvas rendering, PDF-content overlay, objects, reflow layout */
+/* Edivora — page views: canvas rendering, PDF-content overlay, objects, reflow layout */
 'use strict';
 (function () {
   const V = (PE.view = {
@@ -185,6 +185,7 @@
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, off.width, off.height);
         if (pg.src.t === 'img') {
+          if (PE.ocr && PE.ocr.ensureImageEx(pg)) V.renderOverlay(pg);
           const a = PE.assets[pg.src.a];
           const im = await loadImg(a.url);
           const { W, H } = PE.baseSize(pg);
@@ -427,7 +428,9 @@
     if (info.auto) {
       el.style.width = 'max-content';
       el.style.minWidth = info.w + 'px';
-      el.style.maxWidth = Math.max(info.w, ex.W - b.x - (info.dx || 0) - 8) + 'px';
+      // text in a table cell wraps at the cell's edge; other single lines may grow to the page edge
+      const limit = b.maxR && !info.dx ? b.maxR - b.x : ex.W - b.x - (info.dx || 0) - 8;
+      el.style.maxWidth = Math.max(info.w, limit) + 'px';
     } else {
       el.style.width = info.w + 'px';
       el.style.minWidth = el.style.maxWidth = '';
@@ -460,6 +463,7 @@
     renderVirtual(pg, pv);
     V.layoutBase(pg);
     if (PE.forms) PE.forms.render(pg, pv);
+    if (PE.ocr) PE.ocr.banner(pg, pv);
     PE.tools && PE.tools.redrawSelection();
   };
   V.relayoutAll = function () {
@@ -486,7 +490,7 @@
         pv.baseEls[b.id] = keepEl;
         continue;
       }
-      const el = PE.h('div', { class: 'bb', 'data-bid': b.id });
+      const el = PE.h('div', { class: b.ocr ? 'bb ocr' : 'bb', 'data-bid': b.id });
       pv.baseEls[b.id] = el;
       frag.appendChild(el);
     }
@@ -520,19 +524,14 @@
       applyBlockStyle(el, ex, b, info);
       const h = el.offsetHeight;
       const g = h - info.h0;
-      if (Math.abs(g) > 0.5) grow[b.id] = g;
+      // in a scan, single-line pieces (form fields, labels) don't push anything; paragraphs of running text do
+      if (Math.abs(g) > 0.5 && !(b.ocr && b.single)) grow[b.id] = g;
     }
-    // 2) propagate shifts top-down
-    const shift = {};
-    if (PE.settings.reflow && Object.keys(grow).length)
-      for (const id of (PE.buildPreds(ex), ex.order)) {
-        const ps = ex.preds[id];
-        if (!ps || !ps.length) continue;
-        let s = -Infinity;
-        for (const p of ps) s = Math.max(s, (shift[p] || 0) + (grow[p] || 0));
-        if (Math.abs(s) > 0.3) shift[id] = s;
-      }
+    // 2) propagate shifts top-down (tables grow row by row and stretch their borders)
+    const { shift, gpos, tys } = computeShifts(pg, ex, grow);
     pv.shift = shift;
+    pv.gpos = gpos;
+    pv.tys = tys;
     pv.covers.innerHTML = '';
     let overflow = false;
     // 3) place blocks
@@ -556,7 +555,7 @@
         addCover(pv, b, b.bg);
         if (htmlTop(b, info) + sh + (info.dy || 0) + el.offsetHeight > ex.H + 1) overflow = true;
       } else {
-        el.className = 'bb';
+        el.className = b.ocr ? 'bb ocr' : 'bb';
         el.innerHTML = '';
         el.removeAttribute('style');
         el.style.left = b.x + 'px';
@@ -598,32 +597,161 @@
         el.style.cssText = `left:${im.bbox.x}px;top:${im.bbox.y}px;width:${im.bbox.w}px;height:${im.bbox.h}px`;
       }
     }
-    // 5) table lines, rules and boxes that moved with the content
+    // 5) table lines, rules and boxes that moved or stretched with the content
     for (const g of ex.graphics || []) if (pg.ov[g.id] && pg.ov[g.id].del) addCoverRect(pv, { x: g.x, y: g.y, w: g.w, h: g.h }, g.bg);
-    const movedG = (ex.graphics || []).filter((g) => shift[g.id] && !(pg.ov[g.id] && pg.ov[g.id].del));
-    for (const g of movedG) addCoverRect(pv, { x: g.x, y: g.y, w: g.w, h: g.h }, g.bg);
-    for (const g of movedG) {
-      const sh = shift[g.id];
-      const st =
-        g.k === 'rect'
-          ? { left: g.x + 'px', top: g.y + sh + 'px', width: g.w + 'px', height: g.h + 'px', background: g.c }
-          : {
-              left: Math.min(g.x1, g.x2) - (g.x1 === g.x2 ? g.lw / 2 : 0) + 'px',
-              top: Math.min(g.y1, g.y2) - (g.y1 === g.y2 ? g.lw / 2 : 0) + sh + 'px',
-              width: Math.max(g.lw, Math.abs(g.x2 - g.x1)) + 'px',
-              height: Math.max(g.lw, Math.abs(g.y2 - g.y1)) + 'px',
-              background: g.c,
-            };
-      pv.covers.appendChild(PE.h('div', { class: 'gm', style: st }));
-      if (g.y + sh > ex.H) overflow = true;
+    const gById = {};
+    for (const g of ex.graphics || []) gById[g.id] = g;
+    for (const id in gpos) {
+      const c = V.graphicCover(gById[id], gpos[id]);
+      if (c) addCoverRect(pv, c, gById[id].bg, 0);
+    }
+    for (const id in gpos) {
+      const r = gpos[id];
+      pv.covers.appendChild(PE.h('div', { class: 'gm', style: { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px', background: r.c } }));
+      if (r.y > ex.H) overflow = true;
     }
     // areas covered by tables that replaced a table from the PDF
     for (const o of pg.objs) if (o.type === 'table' && o.cover) addCoverRect(pv, o.cover, o.cover.c, 0);
     pv.warn.hidden = !overflow;
   };
-  function addCover(pv, b, bg) {
-    addCoverRect(pv, { x: b.x, y: b.top, w: b.w, h: b.h }, bg);
+  /** how far each element moves down, and where moved/stretched lines and boxes end up */
+  function computeShifts(pg, ex, grow) {
+    const shift = {},
+      gpos = {},
+      tys = {};
+    // tables from the PDF that were turned into editable tables push what's below them
+    const objGrow = {};
+    for (const o of pg.objs)
+      if (o.type === 'table' && o.src) {
+        const el = V.objEl(pg, o.id);
+        const D = (ex.tables || []).find((t) => t.id === o.src);
+        if (el && D) objGrow[o.src] = o.y + el.offsetHeight - (D.y + D.h);
+      }
+    if (!PE.settings.reflow || (!Object.keys(grow).length && !Object.values(objGrow).some((v) => Math.abs(v) > 0.3))) return { shift, gpos, tys };
+    PE.buildPreds(ex);
+    const propagate = (order, preds, out, extra) => {
+      for (const id of order) {
+        const ps = preds[id];
+        if (!ps || !ps.length) continue;
+        let s = -Infinity;
+        for (const p of ps) {
+          let g = grow[p] || 0;
+          if (extra && p in objGrow) g = objGrow[p] - (out[p] || 0);
+          else if (extra) g += extra[p] || 0;
+          s = Math.max(s, (out[p] || 0) + g);
+        }
+        if (Math.abs(s) > 0.3) out[id] = s;
+      }
+    };
+    // growth of each table: rows get taller when the text in one of their cells needs more room
+    const tgrow = {},
+      tinfo = {};
+    for (const T of ex.tables || []) {
+      const n = T.ys.length - 1;
+      const cum = [0],
+        intra = {};
+      for (let r = 0; r < n; r++) {
+        const rg = T.rowGraphs[r];
+        let need = 0;
+        if (rg && rg.els.length && rg.els.some((m) => grow[m.id])) {
+          propagate(rg.order, rg.preds, intra);
+          let best = -Infinity;
+          for (const m of rg.els) if (!m.g) best = Math.max(best, (intra[m.id] || 0) + (grow[m.id] || 0) - (m.gap - rg.minGap));
+          if (best > -Infinity && Math.abs(best) > 0.3) need = best;
+        }
+        cum.push(cum[r] + need);
+      }
+      tinfo[T.id] = { cum, intra };
+      if (Math.abs(cum[n]) > 0.3) tgrow[T.id] = cum[n];
+    }
+    propagate(ex.order, ex.preds, shift, tgrow);
+    for (const T of ex.tables || []) {
+      const ts = shift[T.id] || 0;
+      tys[T.id] = T.ys.map((y, k) => y + ts + tinfo[T.id].cum[k]);
+    }
+    const gById = {};
+    for (const g of ex.graphics || []) gById[g.id] = g;
+    for (const T of ex.tables || []) {
+      const { cum, intra } = tinfo[T.id];
+      const ts = shift[T.id] || 0;
+      if (!ts && !tgrow[T.id] && !Object.keys(intra).length) continue;
+      for (const m of T.mem) {
+        const s = ts + cum[m.row] + (intra[m.id] || 0);
+        if (Math.abs(s) > 0.3) shift[m.id] = s;
+        else delete shift[m.id];
+      }
+      const ys = T.ys;
+      const mapY = (y) => {
+        for (let k = 0; k < ys.length; k++) if (Math.abs(ys[k] - y) <= 1.6) return y + ts + cum[k];
+        if (y < ys[0]) return y + ts;
+        let r = 0;
+        while (r < ys.length - 2 && y > ys[r + 1]) r++;
+        return y + ts + cum[Math.min(r, cum.length - 1)];
+      };
+      for (const id of T.gids) {
+        const g = gById[id];
+        if (!g || (pg.ov[id] && pg.ov[id].del)) continue;
+        const r = V.graphicRect(g, mapY),
+          r0 = V.graphicRect(g, (y) => y);
+        if (Math.abs(r.y - r0.y) > 0.3 || Math.abs(r.h - r0.h) > 0.3) gpos[id] = r;
+      }
+    }
+    for (const g of ex.graphics || []) {
+      if (gpos[g.id] || !shift[g.id] || (pg.ov[g.id] && pg.ov[g.id].del)) continue;
+      const sh = shift[g.id];
+      gpos[g.id] = V.graphicRect(g, (y) => y + sh);
+    }
+    return { shift, gpos, tys };
   }
+  /** display rectangle of a rule / box from the PDF, with its top and bottom edges mapped by mapY */
+  V.graphicRect = function (g, mapY) {
+    if (g.k === 'line') {
+      const lw = Math.max(g.lw || 0, 0.5);
+      const hor = Math.abs(g.y1 - g.y2) < 0.5;
+      const t = mapY(Math.min(g.y1, g.y2)),
+        b = mapY(Math.max(g.y1, g.y2));
+      if (hor) return { x: Math.min(g.x1, g.x2), w: Math.max(lw, Math.abs(g.x2 - g.x1)), y: t - lw / 2, h: lw, c: g.c };
+      return { x: Math.min(g.x1, g.x2) - lw / 2, w: lw, y: t, h: Math.max(lw, b - t), c: g.c };
+    }
+    const t = mapY(g.y),
+      b = mapY(g.y + g.h);
+    return { x: g.x, y: t, w: g.w, h: Math.max(0.1, b - t), c: g.c };
+  };
+  function addCover(pv, b, bg) {
+    // scanned text: a copy of the scan with the letters removed, so the paper texture stays
+    if (b.patch && PE.assets[b.patch.a]) {
+      const p = b.patch;
+      pv.covers.appendChild(
+        PE.h('div', {
+          class: 'cv',
+          style: { left: p.x + 'px', top: p.y + 'px', width: p.w + 'px', height: p.h + 'px', backgroundImage: `url("${PE.assets[p.a].url}")`, backgroundSize: '100% 100%' },
+        })
+      );
+      return;
+    }
+    const r = V.blockCover(b);
+    addCoverRect(pv, r, bg, 0);
+  }
+  /** area hiding a PDF text block's original drawing (kept inside its table cell) */
+  V.blockCover = function (b) {
+    let x0 = b.x - 1,
+      y0 = b.top - 1,
+      x1 = b.x + b.w + 1,
+      y1 = b.top + b.h + 1;
+    if (b.cell) {
+      x0 = Math.max(x0, b.cell.l);
+      y0 = Math.max(y0, b.cell.t);
+      x1 = Math.min(x1, b.cell.r);
+      y1 = Math.min(y1, b.cell.b);
+    }
+    return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
+  };
+  /** cover for a moved/stretched rule: none when the new drawing already spans the old one */
+  V.graphicCover = function (g, r) {
+    const r0 = V.graphicRect(g, (y) => y);
+    if (Math.abs(r.x - r0.x) < 0.01 && Math.abs(r.w - r0.w) < 0.01 && r.y <= r0.y + 0.01 && r.y + r.h >= r0.y + r0.h - 0.01) return null;
+    return { x: g.x - 0.4, y: g.y - 0.4, w: g.w + 0.8, h: g.h + 0.8 };
+  };
   function addCoverRect(pv, r, bg, padding) {
     const pad = padding != null ? padding : 1;
     pv.covers.appendChild(
@@ -647,10 +775,21 @@
     const out = [];
     if (!ex || !pv) return out;
     const shift = pv.shift || {};
-    for (const b of ex.blocks) if (pg.ov[b.id] || shift[b.id]) out.push({ x: b.x - 1, y: b.top - 1, w: b.w + 2, h: b.h + 2, c: b.bg });
+    for (const b of ex.blocks)
+      if (pg.ov[b.id] || shift[b.id]) {
+        if (b.patch && PE.assets[b.patch.a]) out.push({ x: b.patch.x, y: b.patch.y, w: b.patch.w, h: b.patch.h, a: b.patch.a });
+        else out.push(Object.assign(V.blockCover(b), { c: b.bg }));
+      }
     for (const im of ex.images)
       if (pg.ov[im.id] || shift[im.id]) out.push({ x: im.bbox.x - 1, y: im.bbox.y - 1, w: im.bbox.w + 2, h: im.bbox.h + 2, c: im.bg });
-    for (const g of ex.graphics || []) if (shift[g.id] || (pg.ov[g.id] && pg.ov[g.id].del)) out.push({ x: g.x - 1, y: g.y - 1, w: g.w + 2, h: g.h + 2, c: g.bg });
+    const gpos = pv.gpos || {};
+    for (const g of ex.graphics || []) {
+      if (pg.ov[g.id] && pg.ov[g.id].del) out.push({ x: g.x - 1, y: g.y - 1, w: g.w + 2, h: g.h + 2, c: g.bg });
+      else if (gpos[g.id]) {
+        const c = V.graphicCover(g, gpos[g.id]);
+        if (c) out.push(Object.assign(c, { c: g.bg }));
+      }
+    }
     return out;
   };
 
@@ -726,6 +865,7 @@
     if (!el) return;
     if (full) V.fillObj(el, o);
     V.styleObj(el, o);
+    if (o.type === 'table' && o.src) V.layoutBase(pg);
   };
   V.objEl = (pg, id) => {
     const pv = V.els.get(pg.id);
@@ -799,9 +939,11 @@
     tbl.style.setProperty('--tb', o.border || '#000');
     tbl.style.setProperty('--tbw', (o.bw != null ? o.bw : 1) + 'px');
     tbl.style.setProperty('--tpad', (o.pad != null ? o.pad : 4) + 'px');
+    tbl.style.setProperty('--tpady', (o.padY != null ? o.padY : o.pad != null ? o.pad : 4) + 'px');
     const tb = PE.h('tbody');
     o.rows.forEach((row, ri) => {
       const tr = PE.h('tr');
+      if (o.rh && o.rh[ri]) tr.style.height = o.rh[ri] + 'px';
       row.forEach((cell, ci) => {
         const td = PE.h('td', { 'data-r': ri, 'data-c': ci });
         const isHead = o.head && ri === 0;
